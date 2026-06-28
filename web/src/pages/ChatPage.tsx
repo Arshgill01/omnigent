@@ -5336,10 +5336,7 @@ function AgentPicker({
   // There is no terminal→web mirror, so the picker reflects the web-side
   // ``sessionModelOverride`` (which stays correct since a web pick sets it), like
   // cursor/opencode surface theirs.
-  const pickerSelectedModel =
-    modelPickerKind === "cursor" || modelPickerKind === "kiro" || modelPickerKind === "opencode"
-      ? sessionModelOverride
-      : selectedModel;
+  const pickerSelectedModel = sessionModelOverride ?? selectedModel;
   // SDK/bundle agents (no native picker) never have the cross-session sticky
   // applied to them, so their live model is the session's own — the applied
   // override or the bound default — never `selectedModel` (a pick carried over
@@ -5347,7 +5344,9 @@ function AgentPicker({
   // on a Claude-SDK agent like Polly). claude-/codex-native keep `selectedModel`:
   // there the sticky IS the applied model.
   const nonNativeModel =
-    modelPickerKind === null ? (sessionModelOverride ?? llmModel) : (selectedModel ?? llmModel);
+    modelPickerKind === null
+      ? (sessionModelOverride ?? llmModel)
+      : (sessionModelOverride ?? selectedModel ?? llmModel);
   const effectiveModel = nativeVendorOwnsModel
     ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
       ? // cursor mirrors its live TUI model into ``model_override``; kiro sets it
