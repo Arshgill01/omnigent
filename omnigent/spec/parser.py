@@ -363,10 +363,12 @@ def _parse_tools_config(
         return ToolsConfig()
     timeout = int(raw["timeout"]) if "timeout" in raw else 60
     retry = _parse_retry(raw.get("retry"))
-    builtins = _parse_builtin_tools(raw.get("builtins", []))
+    raw_builtins = raw.get("builtins")
+    builtins = _parse_builtin_tools([] if raw_builtins is None else raw_builtins)
+    agents = raw.get("agents")
     sandbox = _parse_sandbox_config(raw.get("sandbox"))
     return ToolsConfig(
-        agents=raw.get("agents", []),
+        agents=[] if agents is None else agents,
         builtins=builtins,
         timeout=timeout,
         retry=retry,

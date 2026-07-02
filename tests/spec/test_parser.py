@@ -2011,6 +2011,48 @@ def test_parse_tools_global_timeout_and_retry(tmp_path: Path) -> None:
     assert spec.tools.retry.max_retries == 4
 
 
+def test_parse_tools_null_builtins_as_empty_list(tmp_path: Path) -> None:
+    """``tools.builtins: null`` matches omitted builtins."""
+    config = {"spec_version": 1, "tools": {"builtins": None}}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    assert spec.tools.builtins == []
+
+
+def test_parse_tools_null_agents_as_empty_list(tmp_path: Path) -> None:
+    """``tools.agents: null`` matches omitted agents."""
+    config = {"spec_version": 1, "tools": {"agents": None}}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    assert spec.tools.agents == []
+
+
+def test_parse_tools_valid_builtins_and_agents_unchanged(tmp_path: Path) -> None:
+    """Valid builtins and agents keep their configured values."""
+    config = {
+        "spec_version": 1,
+        "tools": {
+            "agents": ["researcher", "critic"],
+            "builtins": [
+                "web_search",
+                {"name": "web_search_cfg", "api_key": "pplx-test"},
+            ],
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    assert spec.tools.agents == ["researcher", "critic"]
+    assert [builtin.name for builtin in spec.tools.builtins] == [
+        "web_search",
+        "web_search_cfg",
+    ]
+    assert spec.tools.builtins[0].config == {}
+    assert spec.tools.builtins[1].config == {"api_key": "pplx-test"}
+
+
 def test_parse_builtins_string_entries(tmp_path: Path) -> None:
     """Plain string entries in tools.builtins produce BuiltinToolConfig
     with empty config dicts."""
