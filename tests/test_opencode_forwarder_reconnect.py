@@ -1,9 +1,8 @@
 """Tests for SSE reconnect gap-fill in OpenCodeNativeForwarder (#1778).
 
-Verifies that after an SSE reconnect the forwarder re-seeds its dedupe state
-from the session history so content produced during the disconnect window is
-delivered exactly once, and that content produced before the drop is never
-re-posted.
+Verifies that after an SSE reconnect the forwarder replays persisted history so
+content produced during the disconnect window is delivered exactly once, and
+that content produced before the drop is never re-posted.
 """
 
 from __future__ import annotations
@@ -99,14 +98,14 @@ async def test_run_seeds_on_initial_connect() -> None:
     assert fwd.state.mark(fwd._key("text-final", "prt_old")) is False
 
 
-async def test_run_reseeds_on_reconnect_posts_gap_content() -> None:
+async def test_run_catches_up_on_reconnect_posts_gap_content() -> None:
     """After an SSE disconnect the gap items reach the server exactly once.
 
     Scenario:
       - First connection: msg_1 is processed and dedupe-marked.
-      - Connection drops; during the gap msg_2 is produced by opencode.
-      - Reconnect: seed_dedupe_from_history() is called again; it posts
-        msg_2 from history and marks it. The resumed SSE stream also delivers
+      - Connection drops; during the gap msg_2 is persisted by opencode.
+      - Reconnect: catch_up_from_history() posts msg_2 from history and marks
+        it. The resumed SSE stream also delivers
         msg_2; the dedupe key prevents a second post.
     """
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
@@ -114,14 +113,14 @@ async def test_run_reseeds_on_reconnect_posts_gap_content() -> None:
 
     # --- First SSE connection: deliver msg_1 part ---
     gap_message = {
-        "info": {"id": "msg_2", "role": "assistant"},
+        "info": {"id": "msg_2", "role": "assistant", "time": {"completed": 2}},
         "parts": [{"id": "prt_2", "type": "text", "text": "from gap"}],
     }
     opencode.message_snapshots = [
         [],
         [
             {
-                "info": {"id": "msg_1", "role": "assistant"},
+                "info": {"id": "msg_1", "role": "assistant", "time": {"completed": 1}},
                 "parts": [{"id": "prt_1", "type": "text", "text": "hello"}],
             },
             gap_message,
@@ -160,19 +159,23 @@ async def test_run_reseeds_on_reconnect_posts_gap_content() -> None:
     assert texts == ["hello", "from gap"]
 
 
-async def test_seed_called_on_reconnect_not_just_first_connect() -> None:
-    """seed_dedupe_from_history is invoked on every attempt, not just the first."""
+async def test_catch_up_called_on_reconnect_not_initial_connect() -> None:
+    """Initial connect is mark-only; reconnects replay persisted history."""
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
     fwd = _forwarder(server, opencode)
 
     seed_calls: list[int] = []
-    original_seed = fwd.seed_dedupe_from_history
+    catch_up_calls: list[int] = []
 
-    async def _counting_seed(*, post_unseen_text: bool = False) -> None:
+    async def _counting_seed() -> None:
         seed_calls.append(1)
-        await original_seed(post_unseen_text=post_unseen_text)
 
     fwd.seed_dedupe_from_history = _counting_seed  # type: ignore[method-assign]
+
+    async def _counting_catch_up() -> None:
+        catch_up_calls.append(1)
+
+    fwd.catch_up_from_history = _counting_catch_up  # type: ignore[method-assign]
 
     import httpx as _httpx
 
@@ -194,8 +197,168 @@ async def test_seed_called_on_reconnect_not_just_first_connect() -> None:
     finally:
         fwd_mod.asyncio.sleep = orig_sleep  # type: ignore[assignment]
 
-    # 3 attempts (initial + 2 reconnects) → seed called 3 times.
-    assert len(seed_calls) == 3
+    assert len(seed_calls) == 1
+    assert len(catch_up_calls) == 2
+
+
+async def test_reconnect_catches_up_user_text_and_tool_parts() -> None:
+    """Reconnect catch-up replays all persisted part types the live stream mirrors."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+
+    opencode.message_snapshots = [
+        [],
+        [
+            {
+                "info": {"id": "msg_u", "role": "user"},
+                "parts": [
+                    {
+                        "id": "prt_u",
+                        "messageID": "msg_u",
+                        "type": "text",
+                        "text": "run the command",
+                    }
+                ],
+            },
+            {
+                "info": {"id": "msg_a", "role": "assistant", "time": {"completed": 2}},
+                "parts": [
+                    {
+                        "id": "prt_t",
+                        "messageID": "msg_a",
+                        "type": "tool",
+                        "callID": "call_1",
+                        "tool": "bash",
+                        "state": {
+                            "status": "completed",
+                            "input": {"command": "pwd"},
+                            "output": "/workspace",
+                        },
+                    },
+                    {
+                        "id": "prt_a",
+                        "messageID": "msg_a",
+                        "type": "text",
+                        "text": "done",
+                    },
+                ],
+            },
+        ],
+    ]
+    opencode._event_batches = [
+        [],
+        [
+            _ev("message.updated", info={"id": "msg_u", "role": "user"}),
+            _ev(
+                "message.part.updated",
+                part={
+                    "id": "prt_u",
+                    "messageID": "msg_u",
+                    "type": "text",
+                    "text": "run the command",
+                },
+            ),
+            _ev("message.updated", info={"id": "msg_a", "role": "assistant"}),
+            _ev(
+                "message.part.updated",
+                part={
+                    "id": "prt_t",
+                    "messageID": "msg_a",
+                    "type": "tool",
+                    "callID": "call_1",
+                    "tool": "bash",
+                    "state": {
+                        "status": "completed",
+                        "input": {"command": "pwd"},
+                        "output": "/workspace",
+                    },
+                },
+            ),
+            _ev(
+                "message.part.updated",
+                part={
+                    "id": "prt_a",
+                    "messageID": "msg_a",
+                    "type": "text",
+                    "text": "done",
+                },
+            ),
+            _ev("session.idle"),
+        ],
+    ]
+
+    async def _no_sleep(_s: float) -> None:
+        pass
+
+    orig_sleep = fwd_mod.asyncio.sleep
+    fwd_mod.asyncio.sleep = _no_sleep  # type: ignore[assignment]
+    try:
+        await fwd.run(max_reconnects=1)
+    finally:
+        fwd_mod.asyncio.sleep = orig_sleep  # type: ignore[assignment]
+
+    items = [b["data"] for _u, b in server.posts if b["type"] == "external_conversation_item"]
+    item_types = [item["item_type"] for item in items]
+    assert item_types == ["message", "function_call", "function_call_output", "message"]
+    assert items[0]["item_data"]["role"] == "user"
+    assert items[0]["item_data"]["content"][0]["text"] == "run the command"
+    assert items[1]["item_data"]["name"] == "bash"
+    assert items[2]["item_data"]["output"] == "/workspace"
+    assert items[3]["item_data"]["role"] == "assistant"
+    assert items[3]["item_data"]["content"][0]["text"] == "done"
+
+
+async def test_reconnect_does_not_finalize_incomplete_assistant_text_snapshot() -> None:
+    """A still-streaming assistant text snapshot must not be frozen as final."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+
+    opencode.message_snapshots = [
+        [],
+        [
+            {
+                "info": {"id": "msg_streaming", "role": "assistant"},
+                "parts": [
+                    {
+                        "id": "prt_streaming",
+                        "messageID": "msg_streaming",
+                        "type": "text",
+                        "text": "partial",
+                    }
+                ],
+            }
+        ],
+    ]
+    opencode._event_batches = [
+        [],
+        [
+            _ev("message.updated", info={"id": "msg_streaming", "role": "assistant"}),
+            _ev(
+                "message.part.updated",
+                part={
+                    "id": "prt_streaming",
+                    "messageID": "msg_streaming",
+                    "type": "text",
+                    "text": "partial then complete",
+                },
+            ),
+            _ev("session.idle"),
+        ],
+    ]
+
+    async def _no_sleep(_s: float) -> None:
+        pass
+
+    orig_sleep = fwd_mod.asyncio.sleep
+    fwd_mod.asyncio.sleep = _no_sleep  # type: ignore[assignment]
+    try:
+        await fwd.run(max_reconnects=1)
+    finally:
+        fwd_mod.asyncio.sleep = orig_sleep  # type: ignore[assignment]
+
+    items = [b["data"] for _u, b in server.posts if b["type"] == "external_conversation_item"]
+    assert len(items) == 1
+    assert items[0]["item_data"]["content"][0]["text"] == "partial then complete"
 
 
 async def test_reconnect_does_not_repost_already_seeded_content() -> None:

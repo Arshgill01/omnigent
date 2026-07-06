@@ -113,6 +113,16 @@ def _int_or_zero(value: Any) -> int:
     return value if isinstance(value, int) and value >= 0 else 0
 
 
+def _message_is_complete(info: Mapping[str, Any] | None) -> bool:
+    """Return whether an OpenCode message snapshot is complete."""
+    if not isinstance(info, Mapping):
+        return False
+    time_info = info.get("time")
+    if not isinstance(time_info, Mapping):
+        return False
+    return isinstance(time_info.get("completed"), (int, float))
+
+
 class OpenCodeNativeForwarder:
     """
     Translate one OpenCode session's SSE stream into Omnigent events.
@@ -182,7 +192,7 @@ class OpenCodeNativeForwarder:
         # the new suffix so the web reasoning block grows once, not duplicated.
         self._reasoning_posted: dict[str, int] = {}
 
-    async def seed_dedupe_from_history(self, *, post_unseen_text: bool = False) -> None:
+    async def seed_dedupe_from_history(self) -> None:
         """
         Pre-seed dedupe state from existing OpenCode messages.
 
@@ -190,9 +200,6 @@ class OpenCodeNativeForwarder:
         effort: a failure leaves the dedupe set empty (at worst a few
         re-posts on resume).
 
-        When ``post_unseen_text`` is true, assistant text parts not already
-        marked as finalized are posted before being marked. This catches up
-        messages completed while the SSE stream was disconnected.
         """
         try:
             messages = await self._opencode.list_messages(self._opencode_session_id)
@@ -215,20 +222,10 @@ class OpenCodeNativeForwarder:
                     part_id = part.get("id")
                     if isinstance(part_id, str):
                         self.state.mark(self._key("part", part_id))
-                    # Pre-mark the keys the live handlers check so a resume
-                    # never re-posts already-finalized text / tool parts.
                     if part.get("type") == "text" and isinstance(part_id, str):
-                        text = part.get("text")
-                        if (
-                            post_unseen_text
-                            and role == "assistant"
-                            and isinstance(text, str)
-                            and text
-                            and self.state.mark(self._key("text-final", part_id))
-                        ):
-                            await self._post_assistant_text(text, message_id=message_id)
-                        else:
-                            self.state.mark(self._key("text-final", part_id))
+                        # Pre-mark both the assistant-finalize and user-message
+                        # keys so a startup resume re-posts neither.
+                        self.state.mark(self._key("text-final", part_id))
                         self.state.mark(self._key("user-text", part_id))
                     if part.get("type") == "tool":
                         call_id = part.get("callID")
@@ -244,6 +241,58 @@ class OpenCodeNativeForwarder:
                 "OpenCode forwarder could not re-post usage after seeding", exc_info=True
             )
 
+    async def catch_up_from_history(self) -> None:
+        """
+        Replay unseen persisted OpenCode parts after an SSE reconnect.
+
+        The live stream does not replay missed events. On reconnect, re-read
+        persisted history and feed unseen parts through the same posting paths
+        as live events, then let the normal dedupe keys suppress any duplicate
+        live snapshots that arrive after reconnect.
+        """
+        try:
+            messages = await self._opencode.list_messages(self._opencode_session_id)
+        except Exception:  # noqa: BLE001 - catch-up is best effort.
+            _logger.debug("OpenCode forwarder could not catch up from history", exc_info=True)
+            return
+        for message in messages:
+            if not isinstance(message, Mapping):
+                continue
+            info = message.get("info")
+            message_id = info.get("id") if isinstance(info, Mapping) else None
+            role = info.get("role") if isinstance(info, Mapping) else None
+            if isinstance(message_id, str) and isinstance(role, str):
+                self._msg_role[message_id] = role
+                if role == "assistant":
+                    self._record_assistant_usage(message_id, info)
+            parts = message.get("parts")
+            if not isinstance(parts, list):
+                continue
+            for part in parts:
+                if not isinstance(part, Mapping):
+                    continue
+                part_id = part.get("id")
+                if isinstance(part_id, str):
+                    self.state.mark(self._key("part", part_id))
+                part_type = part.get("type")
+                if part_type == "text":
+                    if role == "user":
+                        await self._post_user_text_part(part)
+                    elif role == "assistant":
+                        self._accumulate_text_part(part)
+                elif part_type == "tool":
+                    await self._handle_tool_part(part)
+                elif part_type == "file":
+                    await self._handle_file_part(part)
+            if role == "assistant" and _message_is_complete(info):
+                await self._flush_pending_text()
+        try:
+            await self._post_session_usage()
+        except Exception:  # noqa: BLE001 - usage re-post is best effort.
+            _logger.debug(
+                "OpenCode forwarder could not re-post usage after catch-up", exc_info=True
+            )
+
     async def run(self, *, max_reconnects: int | None = None) -> None:
         """
         Run the SSE consume loop with reconnect/backoff and gap-fill.
@@ -252,10 +301,10 @@ class OpenCodeNativeForwarder:
         session history so a restart (e.g. runner process restart) never
         re-posts content that was already delivered.
 
-        On *every reconnect* after a dropped stream, the same catch-up is
-        performed to close the gap that opened during the disconnect window.
-        The dedupe set ensures that items posted before the drop are never
-        duplicated.
+        On every reconnect after a dropped stream, persisted history is replayed
+        through the normal post paths to close the gap that opened during the
+        disconnect window. The dedupe set ensures that items posted before the
+        drop are never duplicated.
 
         :param max_reconnects: Reconnect cap (``None`` = unbounded); used
             by tests to bound the loop.
@@ -263,13 +312,10 @@ class OpenCodeNativeForwarder:
         attempt = 0
         backoff = 0.5
         while True:
-            # Seed / catch-up on every attempt (initial start *and* reconnects).
-            # The first call pre-fills the dedupe set from history so no prior
-            # content is re-posted. Subsequent calls fill in the gap that
-            # accumulated while the SSE stream was down — the deduplication
-            # in OpenCodeForwarderState.mark() is idempotent so there is no
-            # double-posting risk.
-            await self.seed_dedupe_from_history(post_unseen_text=attempt > 0)
+            if attempt == 0:
+                await self.seed_dedupe_from_history()
+            else:
+                await self.catch_up_from_history()
             try:
                 await self._consume_once()
                 # Clean stream end (server closed): reconnect.
