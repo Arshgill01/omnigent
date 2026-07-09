@@ -55,32 +55,40 @@ async def test_interrupt_no_session_id_sends_sigterm() -> None:
     ex._proc.terminate.assert_called_once()
 
 
-async def test_interrupt_with_session_sends_cancel_rpc() -> None:
-    """With a session_id, interrupt sends session/cancel over ACP."""
+async def test_interrupt_with_session_sends_cancel_notification() -> None:
+    """With a session_id, interrupt sends the session/cancel notification.
+
+    ``session/cancel`` is an ACP notification: it goes out via ``_send`` with no
+    ``id`` and no reply is expected (Goose ends the in-flight prompt with a
+    cancelled stop reason). Asserting on ``_send`` exercises that real contract.
+    """
     ex = _make_executor()
     ex._proc = _live_proc()
     ex._session_id = "goose_session_42"
 
-    cancel_resp: dict = {"jsonrpc": "2.0", "id": 1, "result": {}}
-    with patch.object(ex, "_rpc", new_callable=AsyncMock, return_value=cancel_resp) as mock_rpc:
+    with patch.object(ex, "_send", new_callable=AsyncMock) as mock_send:
         result = await ex.interrupt_session("s1")
 
     assert result is True
-    mock_rpc.assert_awaited_once()
-    call_args = mock_rpc.call_args
-    assert call_args.args[0] == "session/cancel"
-    assert call_args.args[1]["sessionId"] == "goose_session_42"
-    # SIGTERM should NOT have been sent — clean RPC was enough.
+    mock_send.assert_awaited_once()
+    sent = mock_send.call_args.args[0]
+    assert sent["method"] == "session/cancel"
+    assert sent["params"]["sessionId"] == "goose_session_42"
+    # A notification carries no id — the agent never responds to it.
+    assert "id" not in sent
+    # SIGTERM should NOT have been sent — the clean cancel was enough.
     ex._proc.terminate.assert_not_called()
 
 
-async def test_interrupt_cancel_rpc_error_falls_back_to_sigterm() -> None:
-    """When session/cancel errors, interrupt falls back to SIGTERM."""
+async def test_interrupt_cancel_send_error_falls_back_to_sigterm() -> None:
+    """When the session/cancel send errors, interrupt falls back to SIGTERM."""
     ex = _make_executor()
     ex._proc = _live_proc()
     ex._session_id = "goose_session_99"
 
-    with patch.object(ex, "_rpc", new_callable=AsyncMock, side_effect=RuntimeError("timeout")):
+    with patch.object(
+        ex, "_send", new_callable=AsyncMock, side_effect=RuntimeError("broken pipe")
+    ):
         result = await ex.interrupt_session("s1")
 
     assert result is True
