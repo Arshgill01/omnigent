@@ -5336,7 +5336,10 @@ function AgentPicker({
   // There is no terminal→web mirror, so the picker reflects the web-side
   // ``sessionModelOverride`` (which stays correct since a web pick sets it), like
   // cursor/opencode surface theirs.
-  const pickerSelectedModel = sessionModelOverride ?? selectedModel;
+  const pickerSelectedModel =
+    modelPickerKind === "cursor" || modelPickerKind === "kiro" || modelPickerKind === "opencode"
+      ? sessionModelOverride
+      : (sessionModelOverride ?? selectedModel);
   // SDK/bundle agents (no native picker) never have the cross-session sticky
   // applied to them, so their live model is the session's own — the applied
   // override or the bound default — never `selectedModel` (a pick carried over
