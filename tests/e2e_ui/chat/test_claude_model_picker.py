@@ -163,9 +163,7 @@ def test_claude_native_picker_prefers_session_override_over_sticky_model(
     seeded_session: tuple[str, str],
 ) -> None:
     """The active row follows the session override, not another session's pick."""
-    page.add_init_script(
-        "window.localStorage.setItem('omnigent.picker.model', 'sonnet')"
-    )
+    page.add_init_script("window.localStorage.setItem('omnigent.picker.model', 'sonnet')")
     base_url, session_id = seeded_session
     _patch_session_as_claude_native(page, session_id, model_override="sonnet_5")
 
