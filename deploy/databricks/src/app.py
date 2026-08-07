@@ -153,6 +153,12 @@ try:
         SqlAlchemyPermissionStore,
     )
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+    from omnigent.stores.project_store.sqlalchemy_store import (
+        SqlAlchemyProjectStore,
+    )
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
 
     DB_URI = f"postgresql+psycopg://{PGUSER}@{PGHOST}:{PGPORT}/{PGDATABASE}"
     ARTIFACT_URI = f"dbfs:{VOLUME_PATH}"
@@ -179,7 +185,9 @@ try:
     file_comment_store = SqlAlchemyCommentStore(DB_URI)
     permission_store = SqlAlchemyPermissionStore(DB_URI)
     policy_store = SqlAlchemyPolicyStore(DB_URI)
+    project_store = SqlAlchemyProjectStore(DB_URI)
     host_store = HostStore(DB_URI)
+    scheduled_task_store = SqlAlchemyScheduledTaskStore(DB_URI)
 
     agent_cache = AgentCache(artifact_store=artifact_store, cache_dir=CACHE_DIR)
 
@@ -211,7 +219,9 @@ try:
         comment_store=file_comment_store,
         permission_store=permission_store,
         policy_store=policy_store,
+        project_store=project_store,
         host_store=host_store,
+        scheduled_task_store=scheduled_task_store,
         auth_provider=auth_provider,
     )
 

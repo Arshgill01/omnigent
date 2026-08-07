@@ -11,12 +11,13 @@
 // wire fields.
 
 import type { ConversationItem } from "./conversationItems";
-import { isMessageItem } from "./conversationItems";
 import type { MessageContentBlock } from "./blocks";
+import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
+import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
 import type {
-  CodexModelOption,
   ModelUsage,
+  NativeModelOption,
   NestedSessionItem,
   SandboxStatus,
   Session,
@@ -25,6 +26,14 @@ import type {
   SessionStatus,
   SkillSummary,
 } from "./types";
+
+/** Returns the client surface label for the X-Omnigent-Client telemetry header. */
+function getClientSurface(): string {
+  if (isElectronShell()) return "desktop";
+  if (isIOSShell()) return "ios";
+  if (isAndroidShell()) return "android";
+  return "web";
+}
 
 /**
  * MCP-shape elicitation response, used as the `result` argument to
@@ -138,6 +147,8 @@ interface SessionResponseWire {
   model_override?: string | null;
   /** Per-session cost-control switch; `null`/absent = spec default. */
   cost_control_mode_override?: "on" | "off" | null;
+  /** Sub-agent routing switch; `null`/absent reads the same as `"off"` (Default). */
+  subagent_routing_override?: "on" | "off" | null;
   context_window?: number | null;
   last_total_tokens?: number | null;
   total_cost_usd?: number | null;
@@ -156,18 +167,18 @@ interface SessionResponseWire {
    * SSE event the chat would have received live — same fields the
    * `sse.ts` parser already handles.
    */
-  pending_elicitations?: Array<Record<string, unknown>>;
+  pending_elicitations?: Record<string, unknown>[];
   /**
    * Un-consumed web-composer user messages on native-terminal sessions
    * at snapshot time, each ``{pending_id, content}``. Replayed so a
    * client that posted then navigated away / rebound re-hydrates the
    * optimistic bubble. Empty for non-native sessions.
    */
-  pending_inputs?: Array<{
+  pending_inputs?: {
     pending_id: string;
     content: MessageContentBlock[];
     created_by?: string;
-  }>;
+  }[];
   /**
    * Numeric permission level (1=read, 2=edit, 3=manage, 4=owner) the
    * authenticated user holds on this session. Optional on the wire
@@ -188,18 +199,20 @@ interface SessionResponseWire {
    * absent) for top-level sessions.
    */
   sub_agent_name?: string | null;
-  todos?: Array<{
+  kind?: "default" | "sub_agent" | null;
+  todos?: {
     content: string;
     status: "pending" | "in_progress" | "completed";
     activeForm: string;
-  }>;
+  }[];
   /**
    * Skills the bound agent can invoke — bundled + host-discovered
    * (subject to the spec's ``skills_filter``). Just name + one-line
    * description. Surfaced in the web composer's slash-command menu.
    */
   skills?: SkillSummary[];
-  model_options?: CodexModelOption[];
+  /** Runner-owned model picker rows for native sessions. */
+  model_options?: NativeModelOption[];
   /**
    * True while the runner is auto-creating a terminal-first session's
    * terminal. Drives the Terminal-pill spinner; absent on older
@@ -212,6 +225,7 @@ interface SessionResponseWire {
    * `omnigent.server.schemas.SandboxStatus`.
    */
   sandbox_status?: SandboxStatus | null;
+  mcp_startup?: Record<string, McpServerStartup> | null;
   /**
    * Response id of the turn currently in flight, or absent/null when
    * idle. Lets a client reconnecting mid-turn reopen a streaming
@@ -285,6 +299,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     harness: wire.harness ?? null,
     modelOverride: wire.model_override,
     costControlModeOverride: wire.cost_control_mode_override,
+    subagentRoutingOverride: wire.subagent_routing_override,
     contextWindow: wire.context_window,
     lastTotalTokens: wire.last_total_tokens,
     totalCostUsd: wire.total_cost_usd,
@@ -299,11 +314,13 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     permissionLevel: wire.permission_level ?? null,
     parentSessionId: wire.parent_session_id ?? null,
     subAgentName: wire.sub_agent_name ?? null,
+    kind: wire.kind === "sub_agent" ? "sub_agent" : "default",
     todos: wire.todos ?? [],
     skills: wire.skills ?? [],
     codexModelOptions: wire.model_options ?? [],
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,
+    mcpStartup: wire.mcp_startup ?? null,
     activeResponseId: wire.active_response_id ?? null,
   };
 }
@@ -425,7 +442,7 @@ export async function createSession(
   }
   const res = await authenticatedFetch("/v1/sessions", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
     body: JSON.stringify(body),
   });
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
@@ -461,6 +478,7 @@ export async function createBundledSession(
   form.append("bundle", bundle);
   const res = await authenticatedFetch("/v1/sessions", {
     method: "POST",
+    headers: { "X-Omnigent-Client": getClientSurface() },
     body: form,
   });
   if (!res.ok) {
@@ -494,24 +512,14 @@ export async function createBundledSession(
  * @param upToResponseId - Optional truncation point, e.g. "resp_abc". When
  *   set, the fork copies history only up to and including that response
  *   ("fork from here"); omitted, the full history is copied.
- * @param modelOverride - Optional model id to launch the fork on, e.g.
- *   "databricks-gpt-5-4-mini" — the "restart with model" path. Overrides
- *   the model the fork would inherit from the source; the server validates
- *   and family-checks it. Omitted → keep the source's model.
  */
 export async function forkSession(
   sourceId: string,
   title?: string,
   agentId?: string,
   upToResponseId?: string,
-  modelOverride?: string,
 ): Promise<Session> {
-  const body: {
-    title?: string;
-    agent_id?: string;
-    up_to_response_id?: string;
-    model_override?: string;
-  } = {};
+  const body: { title?: string; agent_id?: string; up_to_response_id?: string } = {};
   if (title !== undefined) {
     body.title = title;
   }
@@ -521,12 +529,9 @@ export async function forkSession(
   if (upToResponseId !== undefined) {
     body.up_to_response_id = upToResponseId;
   }
-  if (modelOverride !== undefined) {
-    body.model_override = modelOverride;
-  }
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sourceId)}/fork`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
     body: JSON.stringify(body),
   });
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
@@ -584,17 +589,24 @@ export async function launchRunner(
   hostId: string,
   sessionId: string,
   workspace: string,
-  git?: { branchName: string; baseBranch?: string },
+  git?: { branchName: string; baseBranch?: string; existingWorktree?: boolean },
 ): Promise<{ runnerId: string }> {
   const body: {
     session_id: string;
     workspace: string;
-    git?: { branch_name: string; base_branch?: string };
+    git?: { branch_name: string; base_branch?: string; existing_worktree?: boolean };
   } = { session_id: sessionId, workspace };
   if (git !== undefined) {
+    // `existing_worktree` binds a pre-existing worktree (no worktree is
+    // created; the branch is recorded for the sidebar + delete flow), so it
+    // never carries a base_branch.
     body.git = {
       branch_name: git.branchName,
-      ...(git.baseBranch !== undefined ? { base_branch: git.baseBranch } : {}),
+      ...(git.existingWorktree
+        ? { existing_worktree: true }
+        : git.baseBranch !== undefined
+          ? { base_branch: git.baseBranch }
+          : {}),
     };
   }
   const res = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}/runners`, {
@@ -623,9 +635,11 @@ export async function launchRunner(
  *
  * `null` on `reasoningEffort` / `modelOverride` sends the server's
  * ``"default"`` clear alias (matches the REPL's ``/effort | /model
- * default``). `null` on `costControlModeOverride` is sent as a JSON
- * ``null`` — for that field, "off" is a real value, so explicit null
- * (not an alias) is the server's clear signal.
+ * default``). `null` on `costControlModeOverride` /
+ * `subagentRoutingOverride` is sent as a JSON ``null`` — for those fields
+ * "off" is a real value, so explicit null (not an alias) is the server's
+ * clear signal. Clearing sub-agent routing lands the session on Default,
+ * the same place ``"off"`` does.
  *
  * `silent: true` persists without firing the claude-native tmux
  * forward — use for bind-time auto-apply (e.g. the sticky-pref
@@ -640,11 +654,13 @@ export async function updateSession(
     modelOverride?: string | null;
     codexPlanMode?: boolean;
     costControlModeOverride?: "on" | "off" | null;
+    subagentRoutingOverride?: "on" | "off" | null;
     runnerId?: string;
     silent?: boolean;
+    labels?: Record<string, string>;
   },
 ): Promise<Session> {
-  const body: Record<string, string | boolean | null> = {};
+  const body: Record<string, string | boolean | null | Record<string, string>> = {};
   if ("reasoningEffort" in updates) {
     body.reasoning_effort = updates.reasoningEffort ?? "default";
   }
@@ -657,8 +673,16 @@ export async function updateSession(
   if ("costControlModeOverride" in updates) {
     body.cost_control_mode_override = updates.costControlModeOverride ?? null;
   }
+  if ("subagentRoutingOverride" in updates) {
+    body.subagent_routing_override = updates.subagentRoutingOverride ?? null;
+  }
   if (updates.runnerId !== undefined) {
     body.runner_id = updates.runnerId;
+  }
+  if (updates.labels !== undefined) {
+    // Merge-upsert on the server; an empty-string value clears a label
+    // (e.g. the pinned flag on unpin — see PATCH /v1/sessions handler).
+    body.labels = updates.labels;
   }
   if (updates.silent) {
     body.silent = true;
@@ -802,59 +826,20 @@ export async function fetchSessionItemsPage(
 }
 
 /**
- * Upper bound on pages `fetchInitialHistoryWindow` will fetch before
- * giving up on reaching the previous-user-message boundary. Caps a
- * pathological single turn (thousands of tool calls between two user
- * prompts) from fanning out into unbounded requests on open. When the
- * cap is hit we stop with `hasMore: true`, so the rest stays reachable
- * via scroll-up `loadMoreHistory` — not a silent truncation.
+ * Items the initial window requests, in one round trip.
+ *
+ * Opening a session must not keep fetching afterwards: growing the window
+ * from the transcript's layout effect meant the reader watched history land
+ * for seconds after the page had already settled, with the content shifting
+ * under them each time — and they never asked for it. So the open pays for a
+ * single, larger page instead, and older history is fetched only when they
+ * actually scroll up.
+ *
+ * Sized to cover the previous prompt for a normal turn without the walk this
+ * replaces; a tool-heavy turn can still run longer, and reaching further back
+ * is then the reader's scroll, not a background fetch.
  */
-const MAX_INITIAL_PAGES = 8;
-
-/** A real (non-meta) user prompt — the boundary the initial window snaps to. */
-function isUserPrompt(item: ConversationItem): boolean {
-  return isMessageItem(item) && item.role === "user" && !item.is_meta;
-}
-
-/**
- * Hydrate the initial conversation window: at least
- * `SESSION_HISTORY_PAGE_SIZE` items, but extended further back when
- * needed so the *previous* user prompt is included — i.e.
- * `max(one page, back-to-previous-user-message)`.
- *
- * Why: the flat page size can land mid-turn for a long turn (many tool
- * calls after the last user message), so the user opens the chat to a
- * response with no visible prompt above it. We page backward until we've
- * collected two non-meta user messages (the last turn's prompt plus the
- * one before it) AND met the item floor, so the last full exchange and
- * its preceding prompt are always on screen.
- *
- * Cost: the common case (a page that already holds ≥2 user prompts) is a
- * single request, identical to `fetchSessionItemsPage`. Extra requests
- * fire only for long single turns — exactly the case this targets.
- * Bounded by `MAX_INITIAL_PAGES`.
- *
- * Returns the same `{ items, hasMore }` shape as `fetchSessionItemsPage`
- * so callers feed `oldestItemId` / `hasMoreHistory` from it unchanged.
- */
-export async function fetchInitialHistoryWindow(sessionId: string): Promise<SessionItemsPage> {
-  let items: ConversationItem[] = [];
-  let hasMore = true;
-  for (let pages = 0; pages < MAX_INITIAL_PAGES; pages++) {
-    const cursor = items[0]?.id;
-    const page = await fetchSessionItemsPage(sessionId, cursor ? { olderThan: cursor } : {});
-    items = [...page.items, ...items]; // prepend the older page
-    hasMore = page.hasMore;
-    if (!hasMore) break; // reached the start of the conversation
-    const userCount = items.filter(isUserPrompt).length;
-    if (items.length >= SESSION_HISTORY_PAGE_SIZE && userCount >= 2) break;
-    if (!items[0]?.id) break; // no cursor to page further; avoid a spin
-  }
-  // If the cap stopped us before the previous user prompt (a pathological
-  // single turn spanning >MAX_INITIAL_PAGES pages), `hasMore` stays true so
-  // the rest remains reachable via scroll-up — same fallback as the default.
-  return { items, hasMore };
-}
+export const INITIAL_WINDOW_ITEMS = 100;
 
 /**
  * Flatten a `GET /v1/sessions/{id}` item into the flat

@@ -85,6 +85,30 @@ describe("parseEvent — session.superseded", () => {
   });
 });
 
+describe("parseEvent — session.status (blocked_on)", () => {
+  function blockedOn(data: Record<string, unknown>): string | undefined {
+    const ev = parseEvent("session.status", {
+      conversation_id: "conv_a",
+      status: "running",
+      ...data,
+    });
+    return (ev as SessionStatusEvent | null)?.blockedOn;
+  }
+
+  it("threads the reason so the indicator can name what the agent is parked on", () => {
+    expect(blockedOn({ blocked_on: "permission prompt" })).toBe("permission prompt");
+  });
+
+  it("leaves it undefined when absent (the session is not parked)", () => {
+    expect(blockedOn({})).toBeUndefined();
+  });
+
+  it("ignores an empty or non-string reason rather than rendering a blank one", () => {
+    expect(blockedOn({ blocked_on: "" })).toBeUndefined();
+    expect(blockedOn({ blocked_on: 7 })).toBeUndefined();
+  });
+});
+
 describe("parseEvent — session.status (background_task_count)", () => {
   function bgCount(data: Record<string, unknown>): number | undefined {
     const ev = parseEvent("session.status", { conversation_id: "conv_a", status: "idle", ...data });
@@ -111,5 +135,49 @@ describe("parseEvent — session.status (background_task_count)", () => {
   it("ignores a non-numeric or negative count", () => {
     expect(bgCount({ background_task_count: "2" })).toBeUndefined();
     expect(bgCount({ background_task_count: -1 })).toBeUndefined();
+  });
+});
+
+describe("parseEvent — session.mcp_startup", () => {
+  it("parses a per-server startup map for the MCP startup band", () => {
+    const ev = parseEvent("session.mcp_startup", {
+      conversation_id: "conv_a",
+      servers: {
+        safe: { status: "failed", error: "handshake failed" },
+        "storage-console": { status: "starting", error: null },
+      },
+    });
+    expect(ev).toEqual({
+      type: "session_mcp_startup",
+      conversationId: "conv_a",
+      servers: {
+        safe: { status: "failed", error: "handshake failed" },
+        "storage-console": { status: "starting", error: null },
+      },
+    });
+  });
+
+  it("skips entries with unknown statuses instead of dropping the frame", () => {
+    // A partial map still updates the band; a bogus status must not reach
+    // the store where it would render an unknown state.
+    const ev = parseEvent("session.mcp_startup", {
+      conversation_id: "conv_a",
+      servers: {
+        ok: { status: "ready" },
+        bad: { status: "exploded" },
+      },
+    });
+    expect(ev).toEqual({
+      type: "session_mcp_startup",
+      conversationId: "conv_a",
+      servers: { ok: { status: "ready", error: null } },
+    });
+  });
+
+  it("rejects frames without a conversation id or servers map", () => {
+    expect(parseEvent("session.mcp_startup", { servers: {} })).toBeNull();
+    expect(
+      parseEvent("session.mcp_startup", { conversation_id: "conv_a", servers: "nope" }),
+    ).toBeNull();
   });
 });

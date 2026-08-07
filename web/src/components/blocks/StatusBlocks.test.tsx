@@ -1,80 +1,254 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import { RoutingDecisionChip } from "./StatusBlocks";
+import { RoutingDecisionCard } from "./StatusBlocks";
 
 afterEach(cleanup);
 
-describe("RoutingDecisionChip — intelligent model router", () => {
-  it("applied verdict: names the active model with its tier, plus the rationale line", () => {
+describe("RoutingDecisionCard — session-level auto-routing", () => {
+  it("applied verdict: shows model pill with tier and rationale", () => {
     render(
-      <RoutingDecisionChip
+      <RoutingDecisionCard
         model="databricks-claude-opus-4-8"
-        tier="expensive"
         applied
-        rationale="multi-file refactor needs deep reasoning"
+        rationale="Multi-file refactor needs deep reasoning."
       />,
     );
-    const chip = screen.getByTestId("routing-decision-chip");
-    // Visible without hovering: the short model name + tier render in the
-    // chip text. A missing model/tier would mean the verdict didn't thread
-    // through the block pipeline.
-    expect(chip).toHaveTextContent("Intelligent model router");
-    expect(chip).toHaveTextContent("opus");
-    expect(chip.textContent).not.toContain("(expensive)");
-    // The rationale shows as a muted second line (not hover-only).
-    expect(chip).toHaveTextContent("multi-file refactor needs deep reasoning");
-    expect(chip.getAttribute("data-applied")).toBe("true");
-    // No hover required: the rationale is in the rendered DOM, not just title.
-    expect(chip.querySelector("[data-testid]")).toBeNull();
+    const card = screen.getByTestId("routing-decision-card");
+    expect(card).toHaveTextContent("Smart routing");
+    expect(card).toHaveTextContent("· applied");
+    expect(card).toHaveTextContent("Session");
+    expect(card).toHaveTextContent("opus");
+    expect(card).toHaveTextContent("Multi-file refactor needs deep reasoning.");
+    expect(card.getAttribute("data-applied")).toBe("true");
   });
 
-  it("shadow verdict: reads 'would have picked' instead of naming the active model", () => {
+  it("advisory verdict: shows '· advisory' and the model that would have been picked", () => {
     render(
-      <RoutingDecisionChip
+      <RoutingDecisionCard
         model="databricks-claude-haiku-4-5"
-        tier="cheap"
         applied={false}
-        rationale="trivial question"
+        rationale="Trivial question."
       />,
     );
-    const chip = screen.getByTestId("routing-decision-chip");
-    // applied=false → "would have picked" framing; a flip to the applied
-    // copy would falsely claim the brain ran on the router's pick.
-    expect(chip).toHaveTextContent("would have picked");
-    expect(chip).toHaveTextContent("haiku");
-    expect(chip.getAttribute("data-applied")).toBe("false");
+    const card = screen.getByTestId("routing-decision-card");
+    expect(card).toHaveTextContent("· advisory");
+    expect(card).toHaveTextContent("haiku");
+    expect(card.getAttribute("data-applied")).toBe("false");
   });
 
-  it("renders nothing for the rationale line when rationale is empty", () => {
+  it("shows agent name as row label when mirrored into parent session", () => {
     render(
-      <RoutingDecisionChip
-        model="databricks-claude-sonnet-4-6"
-        tier="medium"
+      <RoutingDecisionCard
+        model="databricks-claude-haiku-4-5"
         applied
-        rationale=""
+        rationale="Simple task."
+        agent="claude_code"
       />,
     );
-    const chip = screen.getByTestId("routing-decision-chip");
-    // Empty rationale still renders the primary line, just no second line —
-    // a stray empty <span> would add visual noise to the transcript.
-    expect(chip).toHaveTextContent("sonnet");
-    expect(chip.textContent).not.toContain("(medium)");
+    const card = screen.getByTestId("routing-decision-card");
+    // The agent name replaces the generic "Session" label so the
+    // orchestrator's transcript identifies which sub-agent was routed.
+    expect(card).toHaveTextContent("claude_code");
+    expect(card.textContent).not.toContain("Session");
   });
 
-  it("never uses the old 'model control' vocabulary (rename sweep)", () => {
+  it("expands raw verdict JSON behind the chevron", () => {
     render(
-      <RoutingDecisionChip
+      <RoutingDecisionCard
         model="databricks-claude-opus-4-8"
-        tier="expensive"
+        applied
+        rationale="Deep reasoning required."
+      />,
+    );
+    // Collapsed by default — raw JSON not visible.
+    expect(screen.queryByText(/"rationale"/)).toBeNull();
+    fireEvent.click(screen.getByTestId("routing-decision-raw-toggle"));
+    expect(screen.getByText(/"rationale"/)).toBeInTheDocument();
+  });
+});
+
+describe("routing decision — harness / scope / raw pick", () => {
+  // Harness + which sub-agent the decision covers: without the badge a
+  // native-subagent decision is indistinguishable from a session one, and a
+  // badge on a session/turn decision would invent a sub-agent that has none.
+  // Every chip also shortens the harness id: "-native" is how the pane runs,
+  // not something a chip needs to say, whatever scope took the decision.
+  it.each([
+    ["native_subagent", "subagent: researcher"],
+    ["turn", null],
+    ["session", null],
+  ] as const)("card: %s scope renders the sub-agent badge as %s", (scope, badge) => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-sonnet-5"
+        applied
+        rationale="short task"
+        agent="researcher"
+        routing={{ harness: "claude-native", scope }}
+      />,
+    );
+    // Anchored: a bare "claude" would also match the unshortened id.
+    expect(screen.getByTestId("routing-decision-harness")).toHaveTextContent(/^· claude$/);
+    if (badge === null) {
+      expect(screen.queryByTestId("routing-decision-scope")).toBeNull();
+    } else {
+      expect(screen.getByTestId("routing-decision-scope")).toHaveTextContent(badge);
+    }
+  });
+
+  // The router's vocabulary pick may have had no endpoint and been mapped to a
+  // servable id — that must be visible. When it resolves to the same short
+  // name there is nothing to disclose, so the row stays off.
+  it.each([
+    ["gpt-5-6-sol", "gpt-5-6-sol"],
+    ["claude-sonnet-5", null],
+  ] as const)("card: raw pick %s is disclosed as %s", (rawModel, shown) => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-sonnet-5"
         applied
         rationale="x"
+        routing={{ rawModel }}
       />,
     );
-    const chip = screen.getByTestId("routing-decision-chip");
-    // The feature was renamed from "Intelligent model control"; the chip
-    // must carry the new name and never the retired one.
-    expect(chip.textContent).toContain("Intelligent model router");
-    expect(chip.textContent).not.toContain("model control");
-    expect(chip.textContent).not.toContain("Model Control");
+    expect(screen.getByTestId("routing-decision-card")).toHaveTextContent("sonnet");
+    if (shown === null) {
+      expect(screen.queryByTestId("routing-decision-raw-model")).toBeNull();
+    } else {
+      expect(screen.getByTestId("routing-decision-raw-model")).toHaveTextContent(shown);
+    }
+  });
+
+  it("card: renders harness, scope badge, raw pick, and the extras in the raw JSON", () => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-sonnet-5"
+        applied
+        rationale="short task"
+        agent="researcher"
+        routing={{
+          harness: "codex-native",
+          scope: "child_session",
+          decisionId: "dec_123",
+          rawModel: "gpt-5-6-sol",
+          attemptedOverride: "databricks-claude-opus-4-8",
+        }}
+      />,
+    );
+    // child_session is a sub-agent scope, so the harness id renders shortened.
+    expect(screen.getByTestId("routing-decision-harness")).toHaveTextContent("codex");
+    // The badge's exact wording is pinned once, on subagentScopeLabel.
+    expect(screen.getByTestId("routing-decision-scope")).toBeTruthy();
+    expect(screen.getByTestId("routing-decision-raw-model")).toHaveTextContent("gpt-5-6-sol");
+    // The overridden ask is the point of the row, so it shows at a glance; the
+    // decision id stays audit data behind the chevron.
+    expect(screen.getByTestId("routing-decision-attempted-override")).toHaveTextContent("opus");
+    fireEvent.click(screen.getByTestId("routing-decision-raw-toggle"));
+    expect(screen.getByText(/"decision_id"/)).toBeInTheDocument();
+    expect(screen.getByText(/"attempted_override"/)).toBeInTheDocument();
+  });
+
+  // Strict adherence to the router means a spawn's own model ask is applied
+  // only when the router agrees; when it doesn't, the substitution has to be
+  // visible without expanding the verdict.
+  it.each([
+    ["databricks-claude-opus-4-8", "opus"],
+    // Same short name as the pill — a struck-through duplicate reads as a bug.
+    ["system.ai.claude-sonnet-5", null],
+  ] as const)("card: attempted override %s is disclosed as %s", (attemptedOverride, shown) => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-sonnet-5"
+        applied
+        rationale="Spawn requested databricks-claude-opus-4-8; overridden."
+        routing={{ attemptedOverride }}
+      />,
+    );
+    if (shown === null) {
+      expect(screen.queryByTestId("routing-decision-attempted-override")).toBeNull();
+    } else {
+      const span = screen.getByTestId("routing-decision-attempted-override");
+      expect(span).toHaveTextContent(shown);
+      expect(span.className).toContain("line-through");
+      // Only the first of (attempted, raw pick, pill) pushes the group right.
+      expect(span.className).toContain("ml-auto");
+    }
+  });
+
+  it("card: the attempted override takes ml-auto ahead of the raw pick", () => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-sonnet-5"
+        applied
+        rationale="x"
+        routing={{ attemptedOverride: "databricks-claude-opus-4-8", rawModel: "gpt-5-6-sol" }}
+      />,
+    );
+    expect(screen.getByTestId("routing-decision-attempted-override").className).toContain(
+      "ml-auto",
+    );
+    // Exactly one spacer, else the row splits into two right-aligned groups.
+    expect(screen.getByTestId("routing-decision-raw-model").className).not.toContain("ml-auto");
+  });
+
+  it("card: omits the new rows and JSON keys when the fields are absent", () => {
+    render(
+      <RoutingDecisionCard model="databricks-claude-opus-4-8" applied rationale="deep reasoning" />,
+    );
+    expect(screen.queryByTestId("routing-decision-harness")).toBeNull();
+    expect(screen.queryByTestId("routing-decision-scope")).toBeNull();
+    expect(screen.queryByTestId("routing-decision-raw-model")).toBeNull();
+    expect(screen.queryByTestId("routing-decision-attempted-override")).toBeNull();
+    fireEvent.click(screen.getByTestId("routing-decision-raw-toggle"));
+    expect(screen.queryByText(/"harness"/)).toBeNull();
+    expect(screen.queryByText(/"raw_model"/)).toBeNull();
+  });
+
+  // Only an AI-Gateway-routed decision is marked: the built-in judge is the
+  // plain case, and a legacy row predates the field entirely.
+  const AIGW_MARK = "routing-decision-source-databricks";
+  const AIGW_NAME = "Routed by the Databricks AI Gateway";
+
+  it("card: marks a decision the Databricks AI Gateway answered", () => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-sonnet-5"
+        applied
+        rationale="x"
+        routing={{ routerSource: "databricks-aigw" }}
+      />,
+    );
+    expect(screen.getByTestId(AIGW_MARK)).toBeTruthy();
+    // The wrapper carries the name — the brand mark itself is aria-hidden, and
+    // it must never announce as the model family ("DBRX").
+    expect(screen.getByRole("img", { name: AIGW_NAME })).toBeTruthy();
+    expect(screen.queryByTitle(/DBRX/i)).toBeNull();
+    expect(screen.queryByLabelText(/DBRX/i)).toBeNull();
+    expect(screen.queryByText(/DBRX/i)).toBeNull();
+    fireEvent.click(screen.getByTestId("routing-decision-raw-toggle"));
+    expect(screen.getByText(/"router_source"/)).toBeInTheDocument();
+  });
+
+  it.each([
+    ["the built-in judge answered", { routerSource: "oss-llm" }],
+    ["the field is absent", {}],
+  ] as const)("card: leaves the mark off when %s", (_case, routing) => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-sonnet-5"
+        applied
+        rationale="x"
+        routing={routing}
+      />,
+    );
+    expect(screen.queryByTestId(AIGW_MARK)).toBeNull();
+    expect(screen.queryByRole("img", { name: AIGW_NAME })).toBeNull();
+  });
+
+  it("card: leaves the mark off a legacy row with no routing at all", () => {
+    render(<RoutingDecisionCard model="databricks-claude-sonnet-5" applied rationale="x" />);
+    expect(screen.queryByTestId(AIGW_MARK)).toBeNull();
+    fireEvent.click(screen.getByTestId("routing-decision-raw-toggle"));
+    expect(screen.queryByText(/"router_source"/)).toBeNull();
   });
 });

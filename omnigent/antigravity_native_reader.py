@@ -123,6 +123,18 @@ _DEFAULT_ROTATION_INTERVAL_S = 3.0
 # exception, never a clean immediate return.
 _STREAM_REENTRY_BACKOFF_S = 0.5
 
+# Teardown drain passes for the interaction bridge + chained re-scan tasks. Cancelling
+# a bridge stops it scheduling a re-scan and vice versa, so the chain collapses fast;
+# a few extra passes give slack without risking an unbounded loop.
+_INTERACTION_DRAIN_PASSES = 4
+
+# Re-scan poll retry budget. The bridge-clear re-scan is the sole backstop on the
+# healthy-stream path (agy emits no frame while parked on a deferred gate and the poll
+# loop is only the failure fallback), so a single swallowed error would strand the gate
+# forever. Retry a bounded number of times before giving up.
+_INTERACTION_RESCAN_POLL_ATTEMPTS = 3
+_INTERACTION_RESCAN_POLL_BACKOFF_S = 0.2
+
 # POST retry policy, kept identical to the transcript forwarder's so mirrored
 # items are delivered with the same transient-retry semantics. Conversation
 # items persist with a random primary key and are NOT deduped server-side, so an
@@ -135,6 +147,16 @@ _POST_RETRY_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 # Session-status edge values (mirror the transcript forwarder's vocabulary).
 _STATUS_RUNNING = "running"
 _STATUS_IDLE = "idle"
+# agy's OWN per-cascade run status, published in every ``GetAllCascadeTrajectories``
+# summary. This is the authoritative "is this turn over" signal — the step-type
+# close detection below only INFERS it, and every agy step type it does not know
+# about is a turn that never closes. Live-verified against agy 1.1.8: RUNNING both
+# while working AND for the whole time a permission gate is parked (75s observed),
+# so IDLE never means "waiting for the human".
+_CASCADE_RUN_STATUS_IDLE = "CASCADE_RUN_STATUS_IDLE"
+# Consecutive idle observations required before the backstop closes a turn. One
+# reading can catch the gap between delivering a turn and agy starting it.
+_QUIESCENT_TICKS_TO_CLOSE = 2
 # Terminal-failure session status (a valid ``external_session_status``; see the
 # ``Literal["idle", "running", "failed"]`` schema). Emitted when an agy turn
 # closes on a model/turn ERROR so the web UI shows the turn FAILED instead of a
@@ -392,6 +414,26 @@ def _summary_activity(summary: dict[str, object]) -> datetime | None:
     return _parse_activity_timestamp(
         summary.get("lastUserInputTime")
     ) or _parse_activity_timestamp(summary.get("lastModifiedTime"))
+
+
+def _cascade_is_idle(summaries: dict[str, object], bound_cascade_id: str) -> bool:
+    """
+    Whether agy itself reports the bound cascade as no longer running.
+
+    Reads :data:`_CASCADE_RUN_STATUS_IDLE` from the cascade's own summary rather
+    than inferring the turn's end from step types. Missing or malformed entries
+    are NOT idle: closing a turn on incomplete information would be worse than
+    leaving the step-based close to do it.
+
+    :param summaries: ``trajectorySummaries`` from
+        :func:`~omnigent.antigravity_native_rpc.get_all_cascade_trajectories`.
+    :param bound_cascade_id: The cascade this reader is bound to.
+    :returns: ``True`` only on an explicit idle status for the bound cascade.
+    """
+    summary = summaries.get(bound_cascade_id)
+    if not isinstance(summary, dict):
+        return False
+    return summary.get("status") == _CASCADE_RUN_STATUS_IDLE
 
 
 def _detect_rotated_cascade(summaries: dict[str, object], bound_cascade_id: str) -> str | None:
@@ -736,6 +778,7 @@ async def _watch_for_rotation(
     interval_s: float,
     skip_cascade_ids: frozenset[str],
     on_rotation: Callable[[str], None],
+    on_quiescent: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """
     Poll ``GetAllCascadeTrajectories`` for a ``/clear`` rotation, then signal once.
@@ -772,8 +815,15 @@ async def _watch_for_rotation(
     :param skip_cascade_ids: Cascade ids a prior rotation attempt failed to bind;
         never re-signalled.
     :param on_rotation: Called once with the detected new cascade id.
+    :param on_quiescent: Optional turn-close BACKSTOP, awaited once the bound
+        cascade has reported idle on :data:`_QUIESCENT_TICKS_TO_CLOSE`
+        consecutive ticks. Unlike ``on_rotation`` this does NOT end the detector:
+        a session can go idle and busy again many times over its life. It exists
+        so a turn the step-based close missed cannot strand the session forever —
+        the cost of a miss becomes one interval, not a permanent hang.
     :returns: None.
     """
+    idle_ticks = 0
     while True:
         await _sleep(interval_s)
         try:
@@ -804,6 +854,13 @@ async def _watch_for_rotation(
         summaries = body.get("trajectorySummaries")
         if not isinstance(summaries, dict):
             continue
+        if on_quiescent is not None:
+            if _cascade_is_idle(summaries, bound_cascade_id):
+                idle_ticks += 1
+                if idle_ticks == _QUIESCENT_TICKS_TO_CLOSE:
+                    await on_quiescent()
+            else:
+                idle_ticks = 0
         new_cascade_id = _detect_rotated_cascade(summaries, bound_cascade_id)
         if new_cascade_id is None or new_cascade_id in skip_cascade_ids:
             continue
@@ -942,6 +999,23 @@ async def supervise_reader(
             if body_holder:
                 body_holder[0].cancel()
 
+    async def _close_turn_if_stranded() -> None:
+        # Turn-close BACKSTOP. The step-based close (``_is_turn_close_step``) is the
+        # fast path; this fires only when agy itself has reported the cascade idle
+        # and Omnigent still believes a turn is open — i.e. the close was missed.
+        # Reconciliation rather than edge detection, so a missed/unknown/reordered
+        # step costs one detector interval instead of stranding the session.
+        if not state.turn_active:
+            return
+        state.turn_active = False
+        _logger.info(
+            "agy reader closing a turn agy reports finished but Omnigent still had "
+            "open (step-based close was missed): session=%s cascade=%s",
+            session_id,
+            cascade_id,
+        )
+        await _post_event(client, session_id, _status_event(_STATUS_IDLE))
+
     def _body_should_stop() -> bool:
         # The reader body stops either on the caller's stop OR once a rotation was
         # detected (so it does not keep mirroring the now-dead conversation). This
@@ -1000,6 +1074,7 @@ async def supervise_reader(
             interval_s=detect_rotation_interval_s,
             skip_cascade_ids=skip_cascade_ids,
             on_rotation=_on_rotation,
+            on_quiescent=_close_turn_if_stranded,
         ),
         name="antigravity-rotation-detector",
     )
@@ -1030,11 +1105,25 @@ async def supervise_reader(
             body_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await body_task
-        active = state.interaction_task
-        if active is not None and not active.done():
-            active.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await active
+        # Drain the bridge and any chained re-scan tasks. Yield once per pass so
+        # a normally-completed bridge's pending ``_clear_slot`` callback lands in
+        # ``interaction_rescans`` before the snapshot — otherwise it escapes the
+        # drain and runs post-teardown. Suppress all exceptions (including
+        # CancelledError) to avoid aborting the drain with orphaned tasks.
+        for _ in range(_INTERACTION_DRAIN_PASSES):
+            await asyncio.sleep(0)
+            inflight = [
+                pending
+                for pending in (state.interaction_task, *state.interaction_rescans)
+                if pending is not None and not pending.done()
+            ]
+            if not inflight:
+                break
+            for pending in inflight:
+                pending.cancel()
+            for pending in inflight:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await pending
 
     # Report how many committed steps (turns) this run mirrored for the bound
     # cascade. The caller uses a count of 0 to distinguish "first TUI-minted
@@ -1105,6 +1194,9 @@ class _ReaderState:
         is later seen NO LONGER WAITING (answered in the agy TUI, or agy timed
         out) to WITHDRAW the still-parked web card (#1200, direction 2). An entry
         is removed once withdrawn so the withdraw posts at most once.
+    :param interaction_rescans: In-flight re-scan tasks scheduled by a bridge's
+        done-callback to surface a WAITING gate deferred while the bridge ran.
+        Held as strong refs so they are not GC'd mid-run; cancelled on teardown.
     """
 
     allocator: _ToolCallIdAllocator
@@ -1121,6 +1213,7 @@ class _ReaderState:
     cumulative_cache_read_input_tokens: int = 0
     interaction_task: asyncio.Task[None] | None = None
     surfaced_elicitations: dict[_StepKey, str] = field(default_factory=dict)
+    interaction_rescans: set[asyncio.Task[None]] = field(default_factory=set)
 
 
 async def _poll_loop(
@@ -1719,8 +1812,11 @@ def _maybe_handle_interaction(
     ``bridge_interaction`` already owns those retries via its own freshest-WAITING
     re-read, so spawning a second task for a retry step would surface a duplicate
     elicitation and a competing delivery. Subsequent WAITING steps are skipped
-    while a task is active; its done-callback then clears the slot so a genuinely
-    new later interaction can fire.
+    while a task is active; its done-callback then clears the slot AND re-scans the
+    freshest steps (:func:`_resurface_pending_interaction`) so a genuinely-NEW gate
+    deferred during that window — e.g. the next segment of a chained ``a && b``
+    command, each gated separately — is surfaced even when no further stream frame
+    will carry it (agy stays parked on that gate, emitting none) (#1472).
 
     The callback gets the SAME ``cascade_id`` + ``port`` (from ``state``) the
     reader discovered, so the bridge targets agy's live conversation without
@@ -1760,21 +1856,105 @@ def _maybe_handle_interaction(
     async def _run_bridge() -> None:
         await on_pending_interaction(cascade_id, state.port, pending)
 
-    def _clear_slot(completed: asyncio.Task[None]) -> None:
-        if state.interaction_task is completed:
-            state.interaction_task = None
-        if not completed.cancelled():
-            exc = completed.exception()
+    def _clear_rescan(done: asyncio.Task[None]) -> None:
+        state.interaction_rescans.discard(done)
+        if not done.cancelled():
+            exc = done.exception()
             if exc is not None:
                 _logger.warning(
-                    "agy interaction bridge task failed (cascade=%s): %r",
+                    "agy interaction re-scan task failed (cascade=%s): %r",
                     cascade_id,
                     exc,
                 )
 
+    def _clear_slot(completed: asyncio.Task[None]) -> None:
+        if state.interaction_task is completed:
+            state.interaction_task = None
+        if completed.cancelled():
+            # Reader teardown cancelled the bridge — the run is ending, so do NOT
+            # spawn a re-scan (teardown drains these tasks; a fresh one would race it).
+            return
+        exc = completed.exception()
+        if exc is not None:
+            _logger.warning(
+                "agy interaction bridge task failed (cascade=%s): %r",
+                cascade_id,
+                exc,
+            )
+        # Re-scan for a WAITING gate the single-in-flight guard deferred while this
+        # bridge ran (e.g. the next segment of a chained ``a && b`` command). agy
+        # emits no frame while parked on that gate, so without the re-scan it hangs.
+        # ``state.interacted`` makes already-surfaced steps no-ops.
+        rescan = asyncio.create_task(
+            _resurface_pending_interaction(
+                cascade_id=cascade_id,
+                state=state,
+                on_pending_interaction=on_pending_interaction,
+            ),
+            name="antigravity-interaction-rescan",
+        )
+        state.interaction_rescans.add(rescan)
+        rescan.add_done_callback(_clear_rescan)
+
     task = asyncio.create_task(_run_bridge(), name="antigravity-interaction-bridge")
     state.interaction_task = task
     task.add_done_callback(_clear_slot)
+
+
+async def _resurface_pending_interaction(
+    *,
+    cascade_id: str,
+    state: _ReaderState,
+    on_pending_interaction: OnPendingInteraction,
+) -> None:
+    """
+    Re-surface a WAITING interaction the single-in-flight guard deferred.
+
+    Scheduled by ``_clear_slot`` after a bridge finishes. Re-reads the freshest
+    trajectory snapshot and re-dispatches every step through
+    :func:`_maybe_handle_interaction`; ``state.interacted`` makes already-surfaced
+    steps no-ops, so only the deferred gate fires. That gate spawns the next bridge,
+    whose clear re-scans again, draining a chain of sequential gates one at a time.
+
+    The snapshot read is retried up to :data:`_INTERACTION_RESCAN_POLL_ATTEMPTS` times
+    because this is the sole backstop on the healthy-stream path (agy emits no frame
+    while parked on the deferred gate; the poll loop is only the failure fallback).
+
+    :param cascade_id: agy cascade id (equal to the conversation id).
+    :param state: Per-run reader state.
+    :param on_pending_interaction: Async callback for a distinct interaction.
+    """
+    steps: list[dict[str, object]] | None = None
+    for attempt in range(_INTERACTION_RESCAN_POLL_ATTEMPTS):
+        try:
+            steps = await asyncio.to_thread(get_trajectory_steps, state.port, cascade_id)
+            break
+        except (httpx.HTTPError, ValueError) as exc:
+            last = attempt == _INTERACTION_RESCAN_POLL_ATTEMPTS - 1
+            _logger.warning(
+                "agy interaction re-scan poll failed (cascade=%s, port=%s, attempt=%d/%d)%s: %r",
+                cascade_id,
+                state.port,
+                attempt + 1,
+                _INTERACTION_RESCAN_POLL_ATTEMPTS,
+                "; giving up — the poll fallback or a later frame must catch the deferred gate"
+                if last
+                else "; retrying",
+                exc,
+            )
+            if last:
+                return
+            await _sleep(_INTERACTION_RESCAN_POLL_BACKOFF_S)
+    if steps is None:  # pragma: no cover - the loop returns on the last failure
+        return
+    for step in steps:
+        _maybe_handle_interaction(
+            step,
+            key=_step_key(step),
+            cascade_id=cascade_id,
+            state=state,
+            on_pending_interaction=on_pending_interaction,
+        )
 
 
 async def _maybe_withdraw_interaction(
@@ -2550,7 +2730,7 @@ async def run_reader_with_bridge(
     # Lazy import: the interaction bridge pulls server-route handlers; keeping it
     # out of module import keeps the reader importable from the lightweight CLI
     # process without eagerly loading the server stack.
-    from omnigent.antigravity_native_interactions import bridge_interaction
+    from omnigent.antigravity_native_interactions import bridge_interaction, tui_injector_for
 
     # Mutable current session id: rotation advances it, and the elicitation hook
     # closure below reads it through this holder so a post-rotation interaction
@@ -2584,6 +2764,11 @@ async def run_reader_with_bridge(
                 port=port,
                 get_steps=_get_steps,
                 request_elicitation=_request_elicitation,
+                # Bind the injector to THIS reader's bridge dir. The default
+                # resolves it from the harness spawn env, which the runner process
+                # hosting this reader does not carry — that failed every web
+                # approval and left agy's own prompt open in the pane.
+                inject_tui=tui_injector_for(bridge_dir),
             )
 
         # Cascades a prior rotation attempt failed to bind — the detector skips them

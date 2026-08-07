@@ -27,6 +27,12 @@ def canonicalize_harness(harness: str | None) -> str | None:
     """
     if harness is None:
         return None
+    # Namespaced generic-ACP ids (``acp:<slug>``) canonicalize to the base
+    # ``acp`` harness for identity / validity / module resolution / model-family
+    # checks. The ``<slug>`` selecting the concrete agent is carried separately in
+    # the spec's ``executor.config`` and read by ``_build_acp_spawn_env``.
+    if harness.startswith("acp:"):
+        return "acp"
     return HARNESS_ALIASES.get(harness, harness)
 
 
@@ -64,7 +70,7 @@ def native_terminal_name(harness: str | None) -> str | None:
     :returns: The terminal short-name, e.g. ``"cursor"``, or ``None`` when
         *harness* is not a native CLI harness.
     """
-    if not is_native_harness(harness):
+    if harness is None or not is_native_harness(harness):
         return None
     canonical = canonicalize_harness(harness) or harness
     # Canonical native ids are ``<name>-native``; some accepted aliases keep the

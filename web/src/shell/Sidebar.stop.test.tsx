@@ -5,6 +5,8 @@
 // confirms through a dialog before firing the stop mutation. See
 // ConversationRow in Sidebar.tsx.
 
+import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
+
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -29,7 +31,13 @@ vi.mock("@/hooks/useConversations", () => ({
     isPending: false,
     isError: false,
   }),
-  usePinnedConversationBackfill: () => [],
+  usePinnedConversations: () => ({
+    data: { conversations: [], filterHonored: true },
+    isSuccess: true,
+  }),
+  useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
+  setConversationPinned: vi.fn(() => Promise.resolve({})),
+  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
   useRenameConversation: () => ({ mutate: vi.fn() }),
   useArchiveConversation: () => ({ mutate: vi.fn() }),
   useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
@@ -39,16 +47,24 @@ vi.mock("@/hooks/useConversations", () => ({
   useProjects: () => ({ data: [] }),
   useMoveToProject: () => ({ mutate: vi.fn() }),
   useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useProjectConfig: () => ({ data: undefined, isLoading: false }),
+  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: () => Promise.resolve([]),
   PROJECT_LABEL_KEY: "omni_project",
 }));
 
 vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/RunnerHealthProvider")>()),
+  ...(await importOriginal<typeof RunnerHealthProviderModule>()),
   useSessionRunnerOnline: (id: string | undefined) => mocks.runnerOnline(id),
 }));
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
+// Force a multi-user (non-local) server so the "Shared with me" tab renders —
+// jsdom's default loopback origin would otherwise read as single-user and hide
+// the tabs the shared-session row actions rely on.
+vi.mock("@/lib/serverOrigin", () => ({ isCurrentServerLocal: () => false }));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { Sidebar } from "./Sidebar";
@@ -183,9 +199,18 @@ describe("sidebar Stop session item", () => {
   });
 
   it("is disabled for non-owners even on a stoppable session", () => {
-    // Owner-gated server-side; a shared viewer (level 1) sees it disabled.
-    mockConversations([{ ...HOST_SPAWNED, permission_level: 1 }]);
+    // Owner-gated server-side; a shared viewer (another user owns it) sees it
+    // disabled. A non-owner session lives on the "Shared with me" tab, so
+    // switch there before opening its kebab.
+    mockConversations([{ ...HOST_SPAWNED, owner: "other@example.com" }]);
     renderSidebar();
+    // Radix Tabs triggers activate on mousedown (primary button), not click.
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-shared"));
     openKebab();
     const item = screen.getByTestId("stop-conversation");
     expect(item).toHaveAttribute("data-disabled");

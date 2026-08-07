@@ -99,6 +99,71 @@ describe("UserBubble markdown rendering", () => {
     const cell = await screen.findByText("1", { selector: "td, td *" });
     expect(cell.closest("table")).not.toBeNull();
   });
+
+  it("renders CJK text around explicit inline math", async () => {
+    const { container } = renderBubble(userBubble(String.raw`中文 \(\sqrt{x + 1}\) 文本`));
+
+    await waitFor(() => expect(container.querySelector(".katex")).not.toBeNull());
+    expect(container.textContent).toContain("中文");
+    expect(container.textContent).toContain("文本");
+    const katex = container.querySelector(".katex") as HTMLElement;
+    expect(katex.querySelector(".sqrt")).not.toBeNull();
+    expect(katex.textContent).toContain("x");
+    expect(katex.textContent).toContain("1");
+  });
+});
+
+describe("UserBubble system messages", () => {
+  it("keeps hook order stable when a system message becomes a regular message", () => {
+    const { rerender } = renderBubble(userBubble("[System: timer build fired]"));
+    expect(screen.getByTestId("system-message")).toBeInTheDocument();
+
+    rerender(
+      <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+        <BubbleView bubble={userBubble("build finished")} />
+      </FileViewerContext.Provider>,
+    );
+
+    expect(screen.queryByTestId("system-message")).toBeNull();
+    expect(screen.getByText("build finished")).toBeInTheDocument();
+  });
+
+  it("renders a steering interrupt as a muted marker and its uploads as their own bubble", () => {
+    // The two items a mid-tool-use steer produces, once the pending-input
+    // drain stops handing the uploads to the marker: Claude's own interrupt
+    // record (text-only) and the user's attachments-only message.
+    renderBubble(userBubble("[Request interrupted by user for tool use]"));
+    const marker = screen.getByTestId("system-message");
+    expect(marker.getAttribute("data-system-kind")).toBe("interrupted");
+    expect(marker).toHaveTextContent("Interrupted");
+    // The raw record must not survive as user-bubble text.
+    expect(screen.queryByText(/\[Request interrupted by user/)).toBeNull();
+    expect(screen.queryByTestId("message-bubble")).toBeNull();
+
+    cleanup();
+
+    renderBubble(
+      userBubble("[Attached: /tmp/uploads/shot1.png]\n\n[Attached: /tmp/uploads/shot2.png]", {
+        content: [
+          { type: "input_image", file_id: "file_1", filename: "shot1.png" },
+          { type: "input_image", file_id: "file_2", filename: "shot2.png" },
+          {
+            type: "input_text",
+            text: "[Attached: /tmp/uploads/shot1.png]\n\n[Attached: /tmp/uploads/shot2.png]",
+          },
+        ],
+      }),
+    );
+    // A real bubble with both screenshots — not the blank pill the stolen
+    // file blocks used to leave behind.
+    expect(screen.getByTestId("message-bubble")).toBeInTheDocument();
+    expect(screen.getByAltText("shot1.png")).toBeInTheDocument();
+    expect(screen.getByAltText("shot2.png")).toBeInTheDocument();
+    // Upload markers are stripped from the text, and an empty text renders
+    // nothing rather than an empty markdown block.
+    expect(screen.queryByText(/\[Attached:/)).toBeNull();
+    expect(screen.queryByTestId("system-message")).toBeNull();
+  });
 });
 
 describe("AssistantBubble lifecycle rendering", () => {
@@ -120,6 +185,13 @@ describe("UserBubble copy button", () => {
     vi.unstubAllGlobals();
   });
 
+  it("uses a compact action button with an 8px content gap", () => {
+    renderBubble(userBubble("copy me please"));
+
+    expect(screen.getByTestId("message-bubble")).toHaveClass("gap-2");
+    expect(screen.getByRole("button", { name: "Copy" })).toHaveAttribute("data-size", "icon-xxs");
+  });
+
   it("copies the message text to the clipboard when clicked", async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     vi.stubGlobal("navigator", { clipboard: { writeText } });
@@ -129,6 +201,51 @@ describe("UserBubble copy button", () => {
     fireEvent.click(screen.getByRole("button", { name: "Copy" }));
 
     await waitFor(() => expect(writeText).toHaveBeenCalledWith("copy me please"));
+  });
+
+  it("falls back to execCommand when the async clipboard is unavailable", async () => {
+    // The iOS webview / non-secure origins expose no navigator.clipboard, which
+    // is exactly where the old direct-writeText guard made this button a silent
+    // no-op. copyText() must fall through to the execCommand path instead.
+    vi.stubGlobal("navigator", {});
+    const realExecCommand = document.execCommand;
+    const execCommand = vi.fn().mockReturnValue(true);
+    document.execCommand = execCommand;
+
+    try {
+      renderBubble(userBubble("copy via fallback"));
+      fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+      await waitFor(() => expect(execCommand).toHaveBeenCalledWith("copy"));
+    } finally {
+      document.execCommand = realExecCommand;
+    }
+  });
+
+  it("shows a toast confirmation on a mobile viewport", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    const real = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      matches: /max-width/.test(query),
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    })) as typeof window.matchMedia;
+    const onToast = vi.fn();
+    window.addEventListener("omnigent:toast", onToast);
+
+    try {
+      renderBubble(userBubble("copy me please"));
+      fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+      await waitFor(() => expect(onToast).toHaveBeenCalled());
+    } finally {
+      window.removeEventListener("omnigent:toast", onToast);
+      window.matchMedia = real;
+    }
   });
 
   it("does not render a copy button for an attachments-only message (no text)", () => {

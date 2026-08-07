@@ -10,6 +10,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DiffEditor, type DiffEditorProps, type DiffOnMount } from "@monaco-editor/react";
 import { useTheme } from "next-themes";
 import { normalizeResolvedTheme } from "@/components/theme/themeMode";
+import {
+  codeFontFamilyForEditor,
+  readCodeFontFamily,
+  readCodeFontSizePx,
+  subscribeCodeFont,
+} from "@/lib/codeFontPreferences";
 import type { Comment } from "@/hooks/useComments";
 import { useCanEdit } from "@/hooks/usePermissions";
 import { detectLang, type ActiveSelection } from "./codeViewerHelpers";
@@ -20,6 +26,7 @@ import {
   resolvedThemeToMonaco,
 } from "./monacoSetup";
 import { useMonacoCommentLayer, type CodeEditorInstance } from "./useMonacoCommentLayer";
+import { attachEditorScrollRestore } from "./useScrollRestore";
 import "./monacoCodeEditor.css";
 
 interface MonacoDiffViewerProps {
@@ -33,6 +40,8 @@ interface MonacoDiffViewerProps {
   layout: "unified" | "split";
   /** Whether whitespace-only changes are hidden. */
   hideWhitespace: boolean;
+  /** Whether long lines soft-wrap (no horizontal scroll). */
+  wrapLines: boolean;
   conversationId: string;
   /** Saved comments — highlighted on the modified side. */
   comments: Comment[];
@@ -56,6 +65,7 @@ export function MonacoDiffViewer({
   path,
   layout,
   hideWhitespace,
+  wrapLines,
   conversationId,
   comments,
   activeSelection,
@@ -93,10 +103,20 @@ export function MonacoDiffViewer({
 
   // The modified-side code editor, obtained from the diff editor on mount.
   const modifiedEditorRef = useRef<CodeEditorInstance | null>(null);
+  // The diff editor itself — its updateOptions propagates the code font to both
+  // panes (per-pane updateOptions would only re-font one side).
+  const diffEditorRef = useRef<Parameters<DiffOnMount>[0] | null>(null);
   const [mounted, setMounted] = useState(false);
+
+  // The diff scrolls inside Monaco, so its offset is cached per conversation +
+  // file rather than via the DOM scroll-restore hook. Kept in its own namespace
+  // so a file's diff and its editor view don't share one offset.
+  const scrollKeyRef = useRef("");
+  scrollKeyRef.current = `viewer-diff:${conversationId}:${path}`;
 
   const handleMount: DiffOnMount = useCallback(
     (diffEditor, monaco) => {
+      diffEditorRef.current = diffEditor;
       const modified = diffEditor.getModifiedEditor();
       modifiedEditorRef.current = modified;
       // Align the modified model's offsets with the raw "after" char offsets that
@@ -108,6 +128,13 @@ export function MonacoDiffViewer({
             ? monaco.editor.EndOfLineSequence.CRLF
             : monaco.editor.EndOfLineSequence.LF,
         );
+      // Restore the reader's place in the diff and cache further scrolling under
+      // the diff's own key.
+      attachEditorScrollRestore(
+        modified,
+        () => scrollKeyRef.current,
+        () => modifiedEditorRef.current === modified,
+      );
       setMounted(true);
     },
     [after],
@@ -116,9 +143,23 @@ export function MonacoDiffViewer({
   useEffect(
     () => () => {
       modifiedEditorRef.current = null;
+      diffEditorRef.current = null;
     },
     [],
   );
+
+  // Apply live code-font changes to both diff panes. Monaco is a fixed-pixel
+  // widget with no CSS-variable path like the chrome font, so the new
+  // size/family must be pushed imperatively; the options memo seeds the initial
+  // value at creation.
+  useEffect(() => {
+    return subscribeCodeFont((font) => {
+      diffEditorRef.current?.updateOptions({
+        fontSize: font.sizePx,
+        fontFamily: codeFontFamilyForEditor(font.family),
+      });
+    });
+  }, []);
 
   // Comments anchor into the current ("after") content == the saved file, so
   // they're always offset-valid here; gate only on edit permission.
@@ -145,27 +186,35 @@ export function MonacoDiffViewer({
       // responsive default in place rather than forcing split at any width.
       minimap: { enabled: false },
       scrollBeyondLastLine: false,
-      fontSize: 12,
+      // Code-font preference (Settings → Appearance), read at creation; live
+      // changes arrive via updateOptions in the effect above. An unset family
+      // resolves to the shared mono stack, so the diff matches the terminal
+      // rather than falling back to Monaco's own platform default.
+      fontSize: readCodeFontSizePx(),
+      fontFamily: codeFontFamilyForEditor(readCodeFontFamily()),
       automaticLayout: true,
       renderOverviewRuler: false,
       ignoreTrimWhitespace: hideWhitespace,
+      // Soft-wrap long lines in both panes so a narrow diff pane (2–3 side by
+      // side) reads top-to-bottom without horizontal scrolling.
+      diffWordWrap: wrapLines ? "on" : "off",
       // Collapse long unchanged runs into expandable bands (like the old pierre
       // diff / GitHub) so only changed hunks + a few context lines are shown.
       hideUnchangedRegions: { enabled: true, contextLineCount: 3 },
     }),
-    [layout, hideWhitespace],
+    [layout, hideWhitespace, wrapLines],
   );
 
   return (
     <div className="flex h-full flex-col">
       <div className="relative min-h-0 flex-1">
         {loadError && (
-          <div className="flex items-center justify-center p-8 text-destructive text-sm">
+          <div className="flex items-center justify-center p-8 text-destructive text-ui">
             Failed to load the diff.
           </div>
         )}
         {!loadError && !ready && (
-          <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+          <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
             Loading diff…
           </div>
         )}

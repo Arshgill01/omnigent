@@ -2,8 +2,20 @@
 
 from __future__ import annotations
 
+from omnigent._platform import installed_interactive_shells
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_plugins import (
+    ANTIGRAVITY_NATIVE_CODING_AGENT,
+    CLAUDE_NATIVE_CODING_AGENT,
+    CODEX_NATIVE_CODING_AGENT,
+    CURSOR_NATIVE_CODING_AGENT,
+    GOOSE_NATIVE_CODING_AGENT,
+    HERMES_NATIVE_CODING_AGENT,
+    KIMI_NATIVE_CODING_AGENT,
+    KIRO_NATIVE_CODING_AGENT,
+    OPENCODE_NATIVE_CODING_AGENT,
+    PI_NATIVE_CODING_AGENT,
+    QWEN_NATIVE_CODING_AGENT,
     NativeCodingAgent,
 )
 from omnigent.harness_plugins import (
@@ -16,6 +28,23 @@ _BY_AGENT_NAME = {agent.agent_name: agent for agent in NATIVE_CODING_AGENTS}
 _BY_HARNESS = {agent.harness: agent for agent in NATIVE_CODING_AGENTS}
 _BY_WRAPPER_LABEL = {agent.wrapper_label: agent for agent in NATIVE_CODING_AGENTS}
 _BY_TERMINAL_NAME = {agent.terminal_name: agent for agent in NATIVE_CODING_AGENTS}
+
+# Canonical built-in ``*-native-ui`` agent names, one per tier-1 native harness.
+# Each is the registry row's ``agent_name`` — a named single-source-of-truth
+# handle so seeding and tests reference the built-in by symbol, not a magic
+# string literal. (The startup seeder loops NATIVE_CODING_AGENTS; these give
+# callers that need one specific built-in a stable name.)
+CLAUDE_NATIVE_AGENT_NAME = CLAUDE_NATIVE_CODING_AGENT.agent_name
+CODEX_NATIVE_AGENT_NAME = CODEX_NATIVE_CODING_AGENT.agent_name
+PI_NATIVE_AGENT_NAME = PI_NATIVE_CODING_AGENT.agent_name
+OPENCODE_NATIVE_AGENT_NAME = OPENCODE_NATIVE_CODING_AGENT.agent_name
+CURSOR_NATIVE_AGENT_NAME = CURSOR_NATIVE_CODING_AGENT.agent_name
+KIRO_NATIVE_AGENT_NAME = KIRO_NATIVE_CODING_AGENT.agent_name
+GOOSE_NATIVE_AGENT_NAME = GOOSE_NATIVE_CODING_AGENT.agent_name
+HERMES_NATIVE_AGENT_NAME = HERMES_NATIVE_CODING_AGENT.agent_name
+ANTIGRAVITY_NATIVE_AGENT_NAME = ANTIGRAVITY_NATIVE_CODING_AGENT.agent_name
+QWEN_NATIVE_AGENT_NAME = QWEN_NATIVE_CODING_AGENT.agent_name
+KIMI_NATIVE_AGENT_NAME = KIMI_NATIVE_CODING_AGENT.agent_name
 
 
 def native_coding_agent_for_agent_name(name: str | None) -> NativeCodingAgent | None:
@@ -60,3 +89,33 @@ def native_coding_agent_for_wrapper_label(wrapper: str | None) -> NativeCodingAg
 def native_coding_agent_for_terminal_name(name: str | None) -> NativeCodingAgent | None:
     """Return the native coding-agent metadata for *name*, if any."""
     return _BY_TERMINAL_NAME.get(name or "")
+
+
+def native_shell_terminal_spec() -> dict[str, dict[str, object]]:
+    """The user-shell terminals every native wrapper declares.
+
+    Native sessions expose the web UI's "+ New shell" affordance, which lets a
+    user open an interactive shell. We declare one terminal per installed shell
+    (:func:`omnigent._platform.installed_interactive_shells`), keyed and
+    commanded by the shell basename (``zsh``/``bash``/``fish``), with the user's
+    ``$SHELL`` first so the UI can treat it as the click default and offer the
+    rest behind a picker. ``caller_process`` / no sandbox matches the native
+    CLI's own unsandboxed stance on the user's workspace. The block is always
+    non-empty, which is also what gates the MCP relay's ``sys_terminal_*``
+    advertisement.
+
+    :returns: A ``terminals:`` mapping, e.g. ``{"zsh": {...}, "bash": {...}}``,
+        with the user's login shell first.
+    """
+    return {
+        shell: {
+            "command": shell,
+            "allow_cwd_override": True,
+            "os_env": {
+                "type": "caller_process",
+                "cwd": ".",
+                "sandbox": {"type": "none"},
+            },
+        }
+        for shell in installed_interactive_shells()
+    }

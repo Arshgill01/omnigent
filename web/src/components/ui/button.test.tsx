@@ -11,9 +11,16 @@
 // jsdom can't compute Tailwind styles, so geometry isn't directly testable;
 // these tests pin the class-level invariant that produced the bug.
 
-import { describe, expect, it } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { buttonVariants } from "./button";
+import { Button, buttonVariants } from "./button";
+import { setOmnigentHostConfig } from "@/lib/host";
+
+afterEach(() => {
+  cleanup();
+  setOmnigentHostConfig({});
+});
 
 // Matches a Tailwind translate utility (`translate-y-px`, `-translate-x-1/2`,
 // `translate-3`), bare or behind variant prefixes (`active:translate-y-px`).
@@ -22,7 +29,17 @@ import { buttonVariants } from "./button";
 const TRANSLATE_UTILITY = /(^|:)-?translate-/;
 
 const VARIANTS = ["default", "outline", "secondary", "ghost", "destructive", "link"] as const;
-const SIZES = ["default", "xs", "sm", "lg", "icon", "icon-xs", "icon-sm", "icon-lg"] as const;
+const SIZES = [
+  "default",
+  "xs",
+  "sm",
+  "lg",
+  "icon",
+  "icon-xxs",
+  "icon-xs",
+  "icon-sm",
+  "icon-lg",
+] as const;
 
 describe("buttonVariants translate/transform composition", () => {
   it.each(VARIANTS.flatMap((variant) => SIZES.map((size) => ({ variant, size }))))(
@@ -55,5 +72,153 @@ describe("buttonVariants translate/transform composition", () => {
       className: "absolute top-1/2 -translate-y-1/2 right-9",
     });
     expect(merged).toContain("-translate-y-1/2");
+  });
+});
+
+describe("buttonVariants icon geometry", () => {
+  it("keeps default button icons at a fixed 14px glyph inside a 16px box", () => {
+    const classes = buttonVariants({});
+    // index.css owns the fixed geometry through this semantic hook; callers can
+    // opt an exceptional icon out with data-icon-size.
+    expect(classes).toContain("button-standard-icons");
+  });
+
+  it("makes icon-xxs a transparent 14px container with a 14px glyph", () => {
+    render(
+      <Button variant="ghost" size="icon-xxs" aria-label="Tiny icon">
+        <svg aria-hidden />
+      </Button>,
+    );
+
+    expect(screen.getByRole("button", { name: "Tiny icon" })).toHaveClass(
+      "size-3.5",
+      "bg-transparent",
+      "hover:bg-transparent",
+      "dark:hover:bg-transparent",
+      "[&_svg]:size-3.5!",
+      "[&_svg]:p-0!",
+    );
+  });
+
+  it("mutes ghost icon buttons by default without changing primary icon contrast", () => {
+    render(
+      <>
+        <Button variant="ghost" size="icon" aria-label="Ghost icon">
+          <svg aria-hidden />
+        </Button>
+        <Button size="icon" aria-label="Primary icon">
+          <svg aria-hidden />
+        </Button>
+      </>,
+    );
+
+    expect(screen.getByRole("button", { name: "Ghost icon" })).toHaveClass(
+      "text-muted-foreground",
+      "hover:text-foreground",
+    );
+    expect(screen.getByRole("button", { name: "Primary icon" })).toHaveClass(
+      "text-primary-foreground",
+    );
+    expect(screen.getByRole("button", { name: "Primary icon" })).not.toHaveClass(
+      "text-muted-foreground",
+    );
+  });
+});
+
+describe("Button radius scale", () => {
+  it("maps default, small, and extra-small buttons to 8px, 6px, and 4px tokens", () => {
+    render(
+      <>
+        <Button data-testid="button-md">Medium</Button>
+        <Button size="sm" data-testid="button-sm">
+          Small
+        </Button>
+        <Button size="xs" data-testid="button-xs">
+          Extra small
+        </Button>
+        <Button size="icon-xs" aria-label="Compact icon" data-testid="button-icon-xs">
+          <svg aria-hidden />
+        </Button>
+      </>,
+    );
+
+    expect(screen.getByTestId("button-md")).toHaveClass("rounded-lg");
+    expect(screen.getByTestId("button-sm")).toHaveClass("rounded-[var(--radius-md)]");
+    expect(screen.getByTestId("button-xs")).toHaveClass("rounded-[var(--radius-sm)]");
+    expect(screen.getByTestId("button-icon-xs")).toHaveClass("rounded-[var(--radius-md)]");
+  });
+});
+
+describe("Button loading state", () => {
+  it("keeps the label in the DOM so the button width doesn't collapse or grow", () => {
+    // The label must stay rendered (just hidden) — replacing it with the
+    // spinner would shrink the button to the spinner's width and shift
+    // neighbouring buttons, which is exactly the bug this prop fixes.
+    render(<Button loading>Update goal</Button>);
+    expect(screen.getByText("Update goal")).toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "Loading" })).toBeInTheDocument();
+  });
+
+  it("disables the button and marks it busy while loading", () => {
+    render(<Button loading>Save</Button>);
+    const button = screen.getByRole("button");
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("aria-busy", "true");
+  });
+
+  it("does not render a spinner when not loading", () => {
+    render(<Button>Save</Button>);
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.getByRole("button")).not.toBeDisabled();
+  });
+
+  it("respects an explicit disabled prop independent of loading", () => {
+    render(
+      <Button disabled loading={false}>
+        Save
+      </Button>,
+    );
+    expect(screen.getByRole("button")).toBeDisabled();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
+  it("does not inject a spinner overlay when asChild is set", () => {
+    // asChild renders the child as the element via Radix Slot, which requires
+    // a single child; injecting an overlay would break that contract.
+    render(
+      <Button asChild loading>
+        <a href="/x">Link</a>
+      </Button>,
+    );
+    expect(screen.getByRole("link")).toBeInTheDocument();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+});
+
+describe("Button analytics (componentId)", () => {
+  it("reports a click to the host sink and still calls the caller's onClick", () => {
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+    const onClick = vi.fn();
+    render(
+      <Button componentId="composer.send" onClick={onClick}>
+        Send
+      </Button>,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    expect(analytics).toHaveBeenCalledExactlyOnceWith({
+      type: "click",
+      componentId: "composer.send",
+      componentKind: "button",
+    });
+    expect(onClick).toHaveBeenCalledOnce();
+  });
+
+  it("emits nothing when componentId is absent", () => {
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+    render(<Button>Send</Button>);
+    fireEvent.click(screen.getByRole("button"));
+    expect(analytics).not.toHaveBeenCalled();
   });
 });

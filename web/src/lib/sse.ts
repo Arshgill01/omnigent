@@ -9,6 +9,7 @@
 // catch — please add an SSE-parser test when you touch this.
 
 import type {
+  BrowserActionRequestEvent,
   ClientTaskCancel,
   CompactionCompleted,
   CompactionFailed,
@@ -52,6 +53,8 @@ import type {
   SessionAgentChangedEvent,
   SessionTodosEvent,
   SessionSandboxStatusEvent,
+  McpServerStartup,
+  SessionMcpStartupEvent,
   SessionTerminalPendingEvent,
   SessionUsageEvent,
   SlashCommand,
@@ -60,9 +63,11 @@ import type {
   StreamEvent,
   TextDelta,
   ToolCall,
+  ToolOutputDelta,
   ToolResult,
 } from "./events";
 import { NATIVE_TOOL_TYPES } from "./events";
+import { routingExtrasFromWire } from "./routingDecision";
 import type { ErrorInfo, ModelUsage, RememberScope, Response } from "./types";
 
 /**
@@ -187,7 +192,7 @@ export function* parseEventLines(lines: Iterable<string>): Iterable<StreamEvent>
 }
 
 /** Token/cost bucket keys on a `ModelUsage`, mapping wire (snake) to camel. */
-const MODEL_USAGE_FIELDS: ReadonlyArray<{ wire: string; camel: keyof ModelUsage }> = [
+const MODEL_USAGE_FIELDS: readonly { wire: string; camel: keyof ModelUsage }[] = [
   { wire: "input_tokens", camel: "inputTokens" },
   { wire: "output_tokens", camel: "outputTokens" },
   { wire: "total_tokens", camel: "totalTokens" },
@@ -319,6 +324,12 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     const final = typeof data.final === "boolean" ? data.final : undefined;
     return { type: "text_delta", delta, messageId, index, final } satisfies TextDelta;
   }
+  if (eventType === "response.function_call_output.delta") {
+    const callId = data.call_id;
+    const delta = data.delta;
+    if (typeof callId !== "string" || !callId || typeof delta !== "string") return null;
+    return { type: "tool_output_delta", callId, delta } satisfies ToolOutputDelta;
+  }
 
   // Reasoning.
   if (eventType === "response.reasoning.started") {
@@ -427,12 +438,29 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
         typeof data.background_task_count === "number" && data.background_task_count >= 0
           ? data.background_task_count
           : undefined;
+      const rawError = data.error;
+      const error =
+        rawError != null &&
+        typeof rawError === "object" &&
+        typeof (rawError as Record<string, unknown>).code === "string" &&
+        typeof (rawError as Record<string, unknown>).message === "string"
+          ? {
+              code: (rawError as Record<string, unknown>).code as string,
+              message: (rawError as Record<string, unknown>).message as string,
+            }
+          : undefined;
+      // Absent = not parked. An empty string is treated the same, so a
+      // blank reason never renders as a dangling parenthetical.
+      const rawBlockedOn = data.blocked_on;
+      const blockedOn = typeof rawBlockedOn === "string" && rawBlockedOn ? rawBlockedOn : undefined;
       return {
         type: "session_status",
         conversationId,
         status,
         responseId,
         backgroundTaskCount,
+        ...(blockedOn !== undefined ? { blockedOn } : {}),
+        ...(error !== undefined ? { error } : {}),
       } satisfies SessionStatusEvent;
     }
     return null;
@@ -599,6 +627,37 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       error: typeof data.error === "string" ? data.error : null,
     } satisfies SessionSandboxStatusEvent;
   }
+  if (eventType === "session.mcp_startup") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const rawServers = data.servers;
+    if (!rawServers || typeof rawServers !== "object" || Array.isArray(rawServers)) return null;
+    // Skip malformed entries rather than dropping the frame — a partial
+    // map still updates the startup band; unknown statuses are ignored.
+    const servers: Record<string, McpServerStartup> = {};
+    for (const [name, record] of Object.entries(rawServers as Record<string, unknown>)) {
+      if (!name || !record || typeof record !== "object" || Array.isArray(record)) continue;
+      const status = (record as Record<string, unknown>).status;
+      if (
+        status !== "starting" &&
+        status !== "ready" &&
+        status !== "failed" &&
+        status !== "cancelled"
+      ) {
+        continue;
+      }
+      const error = (record as Record<string, unknown>).error;
+      servers[name] = {
+        status,
+        error: typeof error === "string" && error ? error : null,
+      };
+    }
+    return {
+      type: "session_mcp_startup",
+      conversationId,
+      servers,
+    } satisfies SessionMcpStartupEvent;
+  }
   if (eventType === "session.input.consumed") {
     // Nested envelope: `{type, data: {item_id, type, data}}`.
     const inner = data.data;
@@ -756,6 +815,25 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       conversationId,
       viewers,
     } satisfies SessionPresenceEvent;
+  }
+
+  // Embedded-browser action request: asks the desktop relay to run the agent's
+  // browser_* action against the view. Ignored by non-Electron renderers.
+  if (eventType === "browser.action_request") {
+    const actionId = data.action_id;
+    const action = data.action;
+    if (typeof actionId !== "string" || !actionId) return null;
+    if (typeof action !== "string" || !action) return null;
+    const rawArgs = data.args;
+    return {
+      type: "browser_action_request",
+      actionId,
+      action,
+      args:
+        rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs)
+          ? (rawArgs as Record<string, unknown>)
+          : {},
+    } satisfies BrowserActionRequestEvent;
   }
 
   // MCP-shape elicitation request.
@@ -939,7 +1017,7 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
     const content = rec.content;
     return {
       type: "message_done",
-      content: Array.isArray(content) ? (content as Array<Record<string, unknown>>) : [],
+      content: Array.isArray(content) ? (content as Record<string, unknown>[]) : [],
       itemId,
       responseId,
     } satisfies MessageDone;
@@ -982,19 +1060,18 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
   }
 
   if (itemType === "routing_decision") {
-    // Drop a malformed frame (empty model / unknown tier) rather than
-    // rendering a broken chip — the relay also persists nothing for it.
+    // Drop a malformed frame (empty model) rather than rendering a broken chip.
     const model = typeof rec.model === "string" ? rec.model : "";
-    const tier = rec.tier;
-    if (!model || (tier !== "cheap" && tier !== "medium" && tier !== "expensive")) {
+    if (!model) {
       return null;
     }
     return {
       type: "routing_decision",
       model,
-      tier,
       applied: rec.applied === true,
       rationale: typeof rec.rationale === "string" ? rec.rationale : "",
+      ...(typeof rec.agent === "string" && rec.agent.length > 0 && { agent: rec.agent }),
+      routing: routingExtrasFromWire(rec),
       itemId,
       responseId,
     } satisfies RoutingDecision;
@@ -1074,7 +1151,7 @@ function responseFromJson(d: Record<string, unknown>): Response {
     id: String(d.id ?? ""),
     status: String(d.status ?? ""),
     model: String(d.model ?? ""),
-    output: Array.isArray(d.output) ? (d.output as Array<Record<string, unknown>>) : [],
+    output: Array.isArray(d.output) ? (d.output as Record<string, unknown>[]) : [],
     createdAt: Number(d.created_at ?? 0),
     completedAt: d.completed_at != null ? Number(d.completed_at) : null,
     previousResponseId: d.previous_response_id != null ? String(d.previous_response_id) : null,

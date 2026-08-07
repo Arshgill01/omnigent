@@ -4,22 +4,29 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import json
 import logging
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
-from typing import Any
+from typing import cast
 
 from omnigent.codex_native_app_server import client_for_transport
 from omnigent.codex_native_bridge import (
     CODEX_NATIVE_BRIDGE_DIR_ENV_VAR,
     CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
+    cancel_pending_mcp_startup,
+    mcp_startup_waiting_detail,
     read_bridge_startup_error,
     read_bridge_state,
+    read_mcp_startup,
     update_active_turn_id,
+    write_codex_config_model,
 )
+from omnigent.inner.codex_goal_command import goal_objective_from_content
 from omnigent.inner.executor import (
+    EnqueuedContent,
     Executor,
     ExecutorConfig,
     ExecutorError,
@@ -28,8 +35,12 @@ from omnigent.inner.executor import (
     ToolSpec,
     TurnComplete,
 )
-from omnigent.inner.native_attachments import materialize_attachment, parse_data_uri
-from omnigent.reasoning_effort import CODEX_EFFORTS, validate_effort
+from omnigent.inner.native_attachments import (
+    materialize_attachment,
+    parse_data_uri,
+    unresolved_attachment_marker,
+)
+from omnigent.reasoning_effort import CODEX_EFFORTS, effort_for_model_switch, validate_effort
 
 _logger = logging.getLogger(__name__)
 
@@ -65,7 +76,7 @@ class CodexNativeExecutor(Executor):
         """:returns: ``True`` because active turns accept ``turn/steer``."""
         return True
 
-    async def enqueue_session_message(self, session_key: str, content: Any) -> bool:
+    async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:
         """
         Steer an active native Codex turn.
 
@@ -107,7 +118,8 @@ class CodexNativeExecutor(Executor):
                 return False
             finally:
                 await client.close()
-            turn_id = response.get("result", {}).get("turnId")
+            result = _json_object(response.get("result"))
+            turn_id = result.get("turnId") if result is not None else None
             if isinstance(turn_id, str) and turn_id:
                 update_active_turn_id(self._bridge_dir, turn_id)
                 _logger.info("Codex native steered active turn: turn_id=%s", turn_id)
@@ -115,15 +127,31 @@ class CodexNativeExecutor(Executor):
 
     async def interrupt_session(self, session_key: str) -> bool:
         """
-        Interrupt the active native Codex turn.
+        Interrupt the active native Codex turn and any in-flight MCP startup.
+
+        Stop means "stop everything": the active turn (which codex may be
+        holding back until MCP startup settles) is interrupted with its
+        recorded turn id, and a still-pending MCP startup round is
+        cancelled the way the Codex TUI does — ``turn/interrupt`` with an
+        empty turn id (its ``startup_interrupt``). Either alone also works:
+        no recorded turn cancels just the startup; no pending startup
+        interrupts just the turn.
 
         :param session_key: Adapter session key. Unused because the
             bridge is per conversation.
-        :returns: ``True`` when an interrupt was sent.
+        :returns: ``True`` when an interrupt or a startup cancel was sent.
         """
         del session_key
         state = read_bridge_state(self._bridge_dir)
-        if state is None or state.active_turn_id is None:
+        if state is None:
+            return False
+        # Flip the local map first: the cancelled record is what the web
+        # band and turn-error text read, even if Codex never acknowledges.
+        # Unlike the runner's Stop handler, the flipped map is not
+        # published here — the inner process has no server client; web
+        # Stop routes through the runner handler, which does publish.
+        pending = cancel_pending_mcp_startup(self._bridge_dir)
+        if state.active_turn_id is None and not pending:
             return False
         client = client_for_transport(
             state.socket_path,
@@ -131,13 +159,26 @@ class CodexNativeExecutor(Executor):
         )
         await client.connect()
         try:
-            await client.request(
-                "turn/interrupt",
-                {
-                    "threadId": state.thread_id,
-                    "turnId": state.active_turn_id,
-                },
-            )
+            if pending:
+                # Startup interrupt first and best-effort: the local
+                # cancel above already updated what Omnigent shows, and a
+                # failure here must not block the active-turn interrupt.
+                try:
+                    await client.request(
+                        "turn/interrupt",
+                        {"threadId": state.thread_id, "turnId": ""},
+                    )
+                except Exception:  # noqa: BLE001 - the local cancel above already took effect.
+                    _logger.warning("Codex native MCP startup interrupt failed", exc_info=True)
+                _logger.info("Codex native MCP startup cancelled: %s", ", ".join(pending))
+            if state.active_turn_id is not None:
+                await client.request(
+                    "turn/interrupt",
+                    {
+                        "threadId": state.thread_id,
+                        "turnId": state.active_turn_id,
+                    },
+                )
         finally:
             await client.close()
         return True
@@ -156,9 +197,8 @@ class CodexNativeExecutor(Executor):
             shape. The latest user message is delivered to Codex.
         :param tools: Tool schemas from Omnigent. Ignored here;
             native Codex owns its own tool surface.
-        :param system_prompt: System prompt from the agent spec.
-            Ignored because the native thread was created by the
-            wrapper.
+        :param system_prompt: System prompt from the agent spec. Native
+            startup instructions are configured before the app-server launches.
         :param config: Per-turn executor config. Its ``model`` and
             ``extra["reasoning_effort"]`` (carrying the Omnigent web
             ``/model`` pick) are applied via a ``thread/settings/update``
@@ -168,7 +208,13 @@ class CodexNativeExecutor(Executor):
         """
         del tools, system_prompt
         settings_overrides = _model_effort_overrides(config)
-        input_items = _latest_user_input_items(messages, self._bridge_dir)
+        latest_user_content = _latest_user_content(messages)
+        goal_objective = goal_objective_from_content(latest_user_content)
+        input_items: list[dict[str, object]] = (
+            [{"type": "text", "text": goal_objective}]
+            if goal_objective is not None
+            else _content_to_input_items(latest_user_content, self._bridge_dir)
+        )
         if not input_items:
             yield ExecutorError(message="Codex native turn had no user input to send")
             return
@@ -189,6 +235,11 @@ class CodexNativeExecutor(Executor):
                 state = read_bridge_state(self._bridge_dir)
                 if state is not None:
                     break
+
+        # No client-side wait for Codex MCP startup: the app-server accepts
+        # ``turn/start`` mid-startup and defers execution until the round
+        # settles (verified against codex 0.142.5), so sending immediately
+        # is safe. The web UI's MCP-startup band explains the wait.
 
         # Serialized against enqueue_session_message: the
         # turn/start-vs-turn/steer decision, the RPC, and the
@@ -213,6 +264,14 @@ class CodexNativeExecutor(Executor):
                 )
                 await client.connect()
                 try:
+                    if goal_objective is not None:
+                        await client.request(
+                            "thread/goal/set",
+                            {
+                                "threadId": state.thread_id,
+                                "objective": goal_objective,
+                            },
+                        )
                     if state.active_turn_id is not None:
                         response = await client.request(
                             "turn/steer",
@@ -222,7 +281,8 @@ class CodexNativeExecutor(Executor):
                                 "input": input_items,
                             },
                         )
-                        turn_id = response.get("result", {}).get("turnId")
+                        result = _json_object(response.get("result"))
+                        turn_id = result.get("turnId") if result is not None else None
                         if isinstance(turn_id, str) and turn_id:
                             update_active_turn_id(self._bridge_dir, turn_id)
                             _logger.info("Codex native steered active turn: turn_id=%s", turn_id)
@@ -242,19 +302,39 @@ class CodexNativeExecutor(Executor):
                                     **settings_overrides,
                                 },
                             )
-                        response = await client.request(
-                            "turn/start",
-                            {
-                                "threadId": state.thread_id,
-                                "input": input_items,
-                            },
-                        )
-                        turn_id = response.get("result", {}).get("turn", {}).get("id")
+                            # Mirror the accepted switch into config.toml —
+                            # the file the forwarder's model mirror and the
+                            # cost-gate hook read. thread/settings/update does
+                            # not write it, so without this the stale launch
+                            # model is mirrored back at the next turn/started
+                            # and silently reverts the switch.
+                            switched_model = settings_overrides.get("model")
+                            if isinstance(switched_model, str) and switched_model:
+                                if not write_codex_config_model(self._bridge_dir, switched_model):
+                                    _logger.warning(
+                                        "Failed to mirror codex model switch into "
+                                        "config.toml: model=%s",
+                                        switched_model,
+                                    )
+                        turn_params: dict[str, object] = {
+                            "threadId": state.thread_id,
+                            "input": input_items,
+                        }
+                        response = await client.request("turn/start", turn_params)
+                        result = _json_object(response.get("result"))
+                        turn = _json_object(result.get("turn")) if result is not None else None
+                        turn_id = turn.get("id") if turn is not None else None
                         if isinstance(turn_id, str) and turn_id:
                             update_active_turn_id(self._bridge_dir, turn_id)
                             _logger.info("Codex native started turn: turn_id=%s", turn_id)
                 except Exception as exc:  # noqa: BLE001 - converted into a harness error event.
                     error_msg = f"Codex native executor error: {exc}"
+                    # Name the servers a still-unsettled MCP startup is
+                    # blocked on — the most common cause of an injection
+                    # failure this early in the session's life.
+                    waiting = mcp_startup_waiting_detail(read_mcp_startup(self._bridge_dir))
+                    if waiting:
+                        error_msg = f"{error_msg} ({waiting})"
                 finally:
                     await client.close()
         if error_msg is not None:
@@ -263,7 +343,7 @@ class CodexNativeExecutor(Executor):
             yield TurnComplete(response=None)
 
 
-def _model_effort_overrides(config: ExecutorConfig | None) -> dict[str, Any]:
+def _model_effort_overrides(config: ExecutorConfig | None) -> dict[str, object]:
     """
     Build Codex ``thread/settings/update`` model / reasoning-effort overrides.
 
@@ -287,7 +367,7 @@ def _model_effort_overrides(config: ExecutorConfig | None) -> dict[str, Any]:
     """
     if config is None:
         return {}
-    overrides: dict[str, Any] = {}
+    overrides: dict[str, object] = {}
     model = config.model
     if isinstance(model, str) and model:
         overrides["model"] = model
@@ -299,6 +379,12 @@ def _model_effort_overrides(config: ExecutorConfig | None) -> dict[str, Any]:
         # current effort rather than failing the whole dispatch.
         _logger.warning("Ignoring unsupported codex reasoning effort: %r", raw_effort)
         effort = None
+    model_str = model if isinstance(model, str) and model else None
+    # A model switch inherits config.toml's effort (the user's xhigh default),
+    # which the switched-to model may reject (GLM has no xhigh). Guard the live
+    # turn: clamp an explicit effort, and when none was requested but the model
+    # caps below the codex default, send that ceiling so the turn does not 400.
+    effort = effort_for_model_switch(effort, model_str)
     if effort:
         overrides["effort"] = effort
     return overrides
@@ -338,23 +424,20 @@ def _session_is_active(session_id: str, request_session_id: str | None) -> bool:
     return request_session_id is None or request_session_id == session_id
 
 
-def _latest_user_input_items(messages: list[Message], bridge_dir: Path) -> list[dict[str, Any]]:
+def _latest_user_content(messages: list[Message]) -> object:
     """
-    Build Codex app-server input items from the latest user message.
+    Return the latest user message content.
 
     :param messages: Executor message list.
-    :param bridge_dir: Bridge directory for materializing image/file
-        attachments, e.g. ``Path("/tmp/omnigent/codex-native/<digest>")``.
-    :returns: Codex ``turn/start``/``turn/steer`` input items, or ``[]``
-        when there is no user content to send.
+    :returns: The latest user content, or ``None`` when absent.
     """
     for message in reversed(messages):
         if message.get("role") == "user":
-            return _content_to_input_items(message.get("content"), bridge_dir)
-    return []
+            return message.get("content")
+    return None
 
 
-def _content_to_input_items(content: Any, bridge_dir: Path) -> list[dict[str, Any]]:
+def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str, object]]:
     """
     Normalize executor content into Codex app-server input items.
 
@@ -375,9 +458,10 @@ def _content_to_input_items(content: Any, bridge_dir: Path) -> list[dict[str, An
     if isinstance(content, str):
         return [{"type": "text", "text": content}] if content else []
     if isinstance(content, list):
-        items: list[dict[str, Any]] = []
-        for block in content:
-            if not isinstance(block, dict):
+        items: list[dict[str, object]] = []
+        for raw_block in content:
+            block = _json_object(raw_block)
+            if block is None:
                 continue
             block_type = block.get("type")
             if block_type in {"input_text", "text"}:
@@ -388,6 +472,8 @@ def _content_to_input_items(content: Any, bridge_dir: Path) -> list[dict[str, An
                 path = materialize_attachment(block, bridge_dir)
                 if path is not None:
                     items.append({"type": "localImage", "path": str(path)})
+                else:
+                    items.append({"type": "text", "text": unresolved_attachment_marker(block)})
             elif block_type == "input_file":
                 file_item = _file_block_to_input_item(block, bridge_dir)
                 if file_item is not None:
@@ -398,7 +484,10 @@ def _content_to_input_items(content: Any, bridge_dir: Path) -> list[dict[str, An
     return [{"type": "text", "text": json.dumps(content, ensure_ascii=True)}]
 
 
-def _file_block_to_input_item(block: dict[str, Any], bridge_dir: Path) -> dict[str, Any] | None:
+def _file_block_to_input_item(
+    block: Mapping[str, object],
+    bridge_dir: Path,
+) -> dict[str, object] | None:
     """
     Convert an ``input_file`` block into a Codex input item.
 
@@ -412,8 +501,9 @@ def _file_block_to_input_item(block: dict[str, Any], bridge_dir: Path) -> dict[s
         ``file_data`` data URI, e.g.
         ``"data:text/plain;base64,aGVsbG8="``.
     :param bridge_dir: Bridge directory for materializing the file.
-    :returns: A Codex ``text`` input item, or ``None`` when the file
-        could not be decoded or materialized.
+    :returns: A Codex ``text`` input item; a visible could-not-load
+        marker item when the file failed to materialize; or ``None``
+        for an empty text file.
     """
     file_data = block.get("file_data")
     if isinstance(file_data, str) and file_data.startswith("data:"):
@@ -422,7 +512,7 @@ def _file_block_to_input_item(block: dict[str, Any], bridge_dir: Path) -> dict[s
             if parsed.mime_type.startswith("text/"):
                 text = base64.b64decode(parsed.base64_payload).decode("utf-8", errors="replace")
                 return {"type": "text", "text": text} if text else None
-        except (ValueError, base64.binascii.Error):
+        except (ValueError, binascii.Error):
             _logger.warning("Failed to decode input_file data URI", exc_info=True)
     path = materialize_attachment(block, bridge_dir)
     if path is not None:
@@ -431,4 +521,11 @@ def _file_block_to_input_item(block: dict[str, Any], bridge_dir: Path) -> dict[s
         # matching _ATTACHMENT_MARKER_RE in
         # omnigent/entities/conversation.py. Keep in sync.
         return {"type": "text", "text": f"[Attached file: {path}]"}
-    return None
+    return {"type": "text", "text": unresolved_attachment_marker(block)}
+
+
+def _json_object(value: object) -> dict[str, object] | None:
+    """Return a string-keyed JSON object, or ``None`` for other shapes."""
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        return None
+    return cast("dict[str, object]", value)

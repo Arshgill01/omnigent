@@ -17,9 +17,10 @@ fun originOf(url: String?): String? {
     // The pinned origin and every page URL both flow through here, so they
     // canonicalize identically.
     val port = uri.port
-    val hasExplicitPort = port != -1 &&
-        !(scheme == "https" && port == 443) &&
-        !(scheme == "http" && port == 80)
+    val hasExplicitPort =
+        port != -1 &&
+            !(scheme == "https" && port == 443) &&
+            !(scheme == "http" && port == 80)
     return if (hasExplicitPort) "$scheme://$host:$port" else "$scheme://$host"
 }
 
@@ -33,6 +34,24 @@ fun originOf(url: String?): String? {
 fun isHttpScheme(scheme: String?): Boolean {
     val normalized = scheme?.lowercase() ?: return false
     return normalized == "http" || normalized == "https"
+}
+
+/**
+ * Server domains whose IdP permits embedded user-agents. Their login redirect
+ * chain runs inside the WebView and the server sets the session cookie on its
+ * own domain, so no system-browser hop is needed.
+ */
+private val IN_WEBVIEW_AUTH_DOMAINS =
+    listOf("databricks.com", "azuredatabricks.net", "databricksapps.com")
+
+/**
+ * True when [origin]'s host is, or sits under, a domain that authenticates in
+ * the WebView. Matches on a dot boundary so a lookalike host like
+ * `databricks.com.example.org` does not qualify.
+ */
+fun usesInWebViewAuth(origin: String?): Boolean {
+    val host = origin?.let(Uri::parse)?.host?.lowercase() ?: return false
+    return IN_WEBVIEW_AUTH_DOMAINS.any { host == it || host.endsWith(".$it") }
 }
 
 /**

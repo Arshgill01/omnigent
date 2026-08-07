@@ -19,6 +19,9 @@ export interface BaseItem {
   type: string;
   response_id: string;
   status: string;
+  /** Server-side creation time (unix epoch seconds). Drives the
+   *  completed-turn "Worked for" duration for reloaded history. */
+  created_at?: number;
 }
 
 export interface MessageItem extends BaseItem {
@@ -59,6 +62,13 @@ export interface ErrorItem extends BaseItem {
   source: string;
   code: string;
   message: string;
+}
+
+export interface ReasoningItem extends BaseItem {
+  type: "reasoning";
+  model: string;
+  summary: { type: string; text: string }[];
+  content?: { type: string; text: string }[];
 }
 
 /** The provider-native tool item types the runtime persists today. */
@@ -145,12 +155,12 @@ export interface RoutingDecisionItem extends BaseItem {
   type: "routing_decision";
   /** Model id the router chose, e.g. `databricks-claude-opus-4-8`. */
   model: string;
-  /** Difficulty tier the router assigned. */
-  tier: "cheap" | "medium" | "expensive";
   /** `true` when the brain ran on `model`; `false` = "would have picked". */
   applied: boolean;
   /** The router's one-line rationale. */
   rationale: string;
+  /** Sub-agent name when mirrored into the parent session; undefined otherwise. */
+  agent?: string;
 }
 
 export type ConversationItem =
@@ -158,6 +168,7 @@ export type ConversationItem =
   | FunctionCallItem
   | FunctionCallOutputItem
   | ErrorItem
+  | ReasoningItem
   | NativeToolItem
   | CompactionItem
   | SlashCommandItem
@@ -179,6 +190,10 @@ export function isFunctionCallOutputItem(item: ConversationItem): item is Functi
 
 export function isErrorItem(item: ConversationItem): item is ErrorItem {
   return item.type === "error";
+}
+
+export function isReasoningItem(item: ConversationItem): item is ReasoningItem {
+  return item.type === "reasoning";
 }
 
 export function isNativeToolItem(item: ConversationItem): item is NativeToolItem {

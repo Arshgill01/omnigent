@@ -7,12 +7,14 @@ import {
   FileTypeIcon,
   FolderTreeIcon,
   ListIcon,
+  MoonIcon,
   SearchIcon,
   SlidersHorizontalIcon,
   XIcon,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useParams } from "@/lib/routing";
+import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
 import {
   useWorkspaceChangedFiles,
@@ -31,6 +33,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { type ChangedSort, FlatFileList } from "./FlatFileList";
 import { FolderTree } from "./FolderTree";
+import { useScrollRestore } from "./useScrollRestore";
 
 interface FilesPanelProps {
   onFileSelect: (path: string) => void;
@@ -136,7 +139,7 @@ function SortSelector({
         <button
           type="button"
           aria-label={`Sort: ${active.label}`}
-          className="flex shrink-0 cursor-pointer items-center gap-1 rounded-full px-2.5 py-[4px] text-muted-foreground text-xs hover:bg-muted hover:text-foreground"
+          className="flex shrink-0 cursor-pointer items-center gap-1 rounded-full px-2.5 py-[4px] text-muted-foreground text-sm hover:bg-muted hover:text-foreground"
         >
           <span>Sort:</span>
           <active.Icon className="size-3.5" />
@@ -162,8 +165,8 @@ function SortSelector({
 // tree (All). One control replaces the old separate Files / Changes rail tabs.
 // ---------------------------------------------------------------------------
 
-// Leading cell in the search toolbar. Rounded-full pills (matching the rail
-// tabs' pill chip) — the active scope fills with the same muted/card mix.
+// Leading cell in the search toolbar. Rounded-full pills match the rail tabs;
+// the active scope uses the same theme selection surface as the sidebar.
 function FileScopeSwitch({
   flatView,
   onChange,
@@ -176,9 +179,8 @@ function FileScopeSwitch({
   const changedSelected = flatView;
   const allSelected = !flatView;
   const pill =
-    "flex cursor-pointer items-center gap-[6px] rounded-full px-[14px] py-[2px] text-[13px] font-medium leading-5 transition-colors";
-  const activePill =
-    "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground";
+    "flex cursor-pointer items-center gap-[6px] rounded-full px-[14px] py-[2px] text-ui font-medium leading-5 transition-colors";
+  const activePill = "bg-muted text-foreground";
   const idlePill = "text-muted-foreground hover:text-foreground";
   return (
     <div role="radiogroup" aria-label="File scope" className="flex shrink-0 items-center gap-1">
@@ -194,7 +196,7 @@ function FileScopeSwitch({
         <ListIcon className="size-3.5 shrink-0" />
         Changed
         {count > 0 && (
-          <span className="shrink-0 font-normal text-[11px] text-muted-foreground tabular-nums">
+          <span className="shrink-0 font-normal text-sm text-muted-foreground tabular-nums">
             {count}
           </span>
         )}
@@ -237,7 +239,7 @@ function SearchFilterInput({
       </span>
       <input
         aria-label={label}
-        className="w-full rounded border border-border bg-transparent px-2 py-1 font-mono text-xs outline-none placeholder:text-muted-foreground focus:border-ring"
+        className="w-full rounded border border-border bg-transparent px-2 py-1 font-mono text-sm outline-none placeholder:text-muted-foreground focus:border-ring"
         onChange={(event) => onChange(event.target.value)}
         placeholder={placeholder}
         type="text"
@@ -284,6 +286,15 @@ export function FilesPanel({
   const runnerWentOffline = useChatStore(
     (s) => s.conversationId === conversationId && s.sessionStatus === "failed",
   );
+  // The runner is offline but the host still holds the workspace on disk,
+  // so the server serves the panel by reading the workspace over the host
+  // tunnel. Show a passive "served from host" badge — the panel keeps
+  // working and no message/agent wake-up is triggered. Only when the host
+  // is also down (or the session isn't host-bound) do the file queries
+  // surface RunnerOfflineError and fall back to the reconnect hint.
+  const runnerOnline = useSessionRunnerOnline(conversationId);
+  const hostOnline = useSessionHostOnline(conversationId);
+  const servedFromHost = runnerOnline === false && hostOnline === true;
   const [changedSearch, setChangedSearch] = useState("");
   const [treeSearch, setTreeSearch] = useState("");
   const [debouncedTreeSearch, setDebouncedTreeSearch] = useState("");
@@ -309,8 +320,9 @@ export function FilesPanel({
     enabled: true,
   });
   const workingDir = envQuery.data?.root ?? null;
-  const changedCount = changedQuery.data?.data.length ?? 0;
-  const hiddenFilesCount = (changedQuery.data?.data ?? []).filter((f) =>
+  const changedFiles = changedQuery.data?.data ?? [];
+  const changedCount = changedFiles.length;
+  const hiddenFilesCount = changedFiles.filter((f) =>
     f.path.split("/").some((seg) => seg.startsWith(".")),
   ).length;
 
@@ -349,6 +361,18 @@ export function FilesPanel({
   // Highlight the filters toggle when include/exclude carry a value.
   const treeFiltersActive = treeInclude.trim().length > 0 || treeExclude.trim().length > 0;
 
+  // Persist/restore the list's scroll position across conversation and view
+  // switches. Keyed per conversation + view (Changed vs All) since the two
+  // lists have independent heights. Readiness is data presence rather than
+  // `isLoading` — the files queries are disabled (not loading) until the
+  // environment query resolves.
+  const scrollRef = useRef<HTMLElement>(null);
+  const scrollKey = conversationId
+    ? `files:${conversationId}:${flatView ? "changed" : "all"}`
+    : null;
+  const dataReady = flatView ? changedQuery.data !== undefined : allFilesQuery.data !== undefined;
+  const handleScroll = useScrollRestore(scrollRef, scrollKey, dataReady);
+
   return (
     <div
       className={cn(
@@ -358,8 +382,26 @@ export function FilesPanel({
     >
       {/* Header — single row: [title · workingDir] [eye] [close?] */}
       <div className="flex shrink-0 items-center gap-2 px-3 py-2">
-        <span className="shrink-0 font-medium text-sm">Working folder</span>
+        <span className="shrink-0 font-medium text-ui">Working folder</span>
         {workingDir && <WorkingDirLabel dir={workingDir} />}
+        {servedFromHost && (
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span
+                  data-testid="files-host-served-badge"
+                  className="flex shrink-0 items-center gap-1 rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
+                >
+                  <MoonIcon className="size-3 shrink-0" />
+                  Asleep
+                </span>
+              </TooltipTrigger>
+              <TooltipContent>
+                Agent is asleep — files shown live from the host. Send a message to wake it.
+              </TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        )}
         <div className="ml-auto flex items-center gap-1">
           <HiddenFilesToggle
             showHidden={showHidden}
@@ -396,7 +438,7 @@ export function FilesPanel({
               <SearchIcon className="size-4 shrink-0 text-muted-foreground" />
               <input
                 aria-label="Search changed files"
-                className="min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground"
+                className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
                 onChange={(event) => setChangedSearch(event.target.value)}
                 placeholder="Search"
                 type="search"
@@ -416,7 +458,7 @@ export function FilesPanel({
                 <SearchIcon className="size-4 shrink-0 text-muted-foreground" />
                 <input
                   aria-label="Search all files"
-                  className="min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground"
+                  className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
                   onChange={(event) => setTreeSearch(event.target.value)}
                   placeholder="Search"
                   type="search"
@@ -463,11 +505,13 @@ export function FilesPanel({
         </div>
       )}
       <section
+        ref={scrollRef}
         className={cn(
           "overflow-y-auto px-2 pb-2",
           flatView ? "pt-1" : "pt-2",
           fillHeight ? "min-h-0 flex-1" : "max-h-72",
         )}
+        onScroll={handleScroll}
       >
         {flatView ? (
           <FlatFileList
@@ -521,7 +565,7 @@ function WorkingDirLabel({ dir }: { dir: string }) {
       <TooltipProvider>
         <Tooltip>
           <TooltipTrigger asChild>
-            <span className="inline-block max-w-full truncate font-mono text-[11px] text-muted-foreground cursor-default">
+            <span className="inline-block max-w-full truncate font-mono text-sm text-muted-foreground cursor-default">
               {dirBasename(dir)}
             </span>
           </TooltipTrigger>

@@ -8,6 +8,7 @@
 // uses camelCase fields + a `type` discriminator string equal to the
 // Python class name lowercased (e.g. ResponseStartBlock → "response_start").
 
+import type { RoutingDecisionExtras } from "./routingDecision";
 import type { RememberScope, Response } from "./types";
 
 /**
@@ -40,6 +41,11 @@ export interface BlockContext {
   responseId: string;
   itemId: string | null;
   createdBy?: string;
+  /** Server-side creation time (unix epoch seconds), when the item came
+   *  from history hydration. A DIFFERENT clock from `timestamp` (page-
+   *  relative `performance.now()` seconds, live streaming only) — never
+   *  mix the two; each is only compared against itself. */
+  createdAtS?: number;
 }
 
 /** Per-message-item content blocks. Both user input and assistant output. */
@@ -204,14 +210,16 @@ export function slashCommandEchoItemId(slashItemId: string): string {
 export interface RoutingDecisionBlock {
   type: "routing_decision";
   ctx: BlockContext;
+  /** Routing identity (harness, scope, decision id …); absent on legacy rows. */
+  routing?: RoutingDecisionExtras;
   /** Model id the router chose, e.g. `databricks-claude-opus-4-8`. */
   model: string;
-  /** Difficulty tier the router assigned. */
-  tier: "cheap" | "medium" | "expensive";
   /** `true` when the brain ran on `model`; `false` = "would have picked". */
   applied: boolean;
   /** The router's one-line rationale; empty string when absent. */
   rationale: string;
+  /** Sub-agent name when mirrored into the parent session; undefined otherwise. */
+  agent?: string;
 }
 
 export interface TerminalCommandBlock {
@@ -488,3 +496,10 @@ export type AnyBlock =
   | ElicitationBlock
   | PolicyDeniedBlock
   | ResponseEndBlock;
+
+/**
+ * Item-id prefix marking a provisional, in-flight assistant-text block —
+ * a live-streaming preview that lives in `blocks` until its authoritative
+ * `text_done` replaces it. Never a real server item id.
+ */
+export const LIVE_ITEM_PREFIX = "live:";

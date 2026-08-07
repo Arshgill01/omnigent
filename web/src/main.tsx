@@ -8,13 +8,24 @@ import { ThemeProvider } from "./components/theme/ThemeProvider";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { ImageLightboxProvider } from "./components/ImageLightbox";
 import { RunnerHealthProvider } from "./hooks/RunnerHealthProvider";
+import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
 import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
 import { resolveIdentity } from "./lib/identity";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
+import {
+  applyDesktopUiFontSize,
+  applyUiFontFamily,
+  readUiFontFamily,
+  readUiFontSizePx,
+} from "./lib/uiFontPreferences";
+import { applyThemePalette, readThemePalette } from "./lib/themePalette";
+import { applyCustomTheme, readCustomTheme } from "./lib/customTheme";
 import { initChatStore } from "./store/chatStore";
+import "katex/dist/katex.min.css";
+import "streamdown/styles.css";
 import "./index.css";
 
 // Start tracing before any request fires so fetch/XHR are patched in time
@@ -48,33 +59,59 @@ void resolveIdentity();
 // No-op off the iOS shell (the inset vars stay at their env()-only defaults).
 initNativeInsets();
 
+// Apply the saved desktop UI font size and family before first paint so there's no flash.
+applyDesktopUiFontSize(readUiFontSizePx());
+applyUiFontFamily(readUiFontFamily());
+
+// The standalone sidebar font size control was removed. Clear its legacy value
+// so sidebar items follow the shared desktop interface size.
+if (typeof window !== "undefined") {
+  try {
+    localStorage.removeItem("omnigent:sidebar-font-size");
+  } catch {
+    // localStorage access errors are non-fatal.
+  }
+}
+
+// Apply the saved color palette (data-theme on <html>) before first paint too,
+// so the app renders in the chosen theme rather than flashing the brand default.
+applyCustomTheme(readCustomTheme());
+applyThemePalette(readThemePalette());
+
 // Probe /v1/info BEFORE the first render so the route table knows
 // whether to mount accounts routes. The probe is unauthed and the
 // failure path resolves to "accounts off" — so even a stalled or
 // missing server doesn't deadlock first paint. We add a small
 // safety timeout (1.5s) so users on a flaky network still get
 // something on screen.
-const _bootProbe: Promise<ServerInfo> = Promise.race([
+const bootProbe: Promise<ServerInfo> = Promise.race([
   resolveServerInfo(),
-  new Promise<ServerInfo>((resolve) =>
+  new Promise<ServerInfo>((resolve) => {
     setTimeout(
       () =>
         resolve({
           accounts_enabled: false,
+          single_user: false,
           login_url: null,
           needs_setup: false,
           databricks_features: false,
           managed_sandboxes_enabled: false,
           sandbox_provider: null,
+          sharing_mode: "on",
+          public_sharing_enabled: true,
           server_version: null,
           smart_routing_enabled: false,
+          smart_routing_sources: { external: false, oss: false },
+          harness_install_enabled: false,
+          installable_harnesses: [],
+          dictation_available: false,
         }),
       1500,
-    ),
-  ),
+    );
+  }),
 ]);
 
-void _bootProbe.then((info) => {
+void bootProbe.then((info) => {
   createRoot(document.getElementById("root")!).render(
     <StrictMode>
       <CapabilitiesProvider info={info}>
@@ -86,7 +123,9 @@ void _bootProbe.then((info) => {
                 <BrowserRouter>
                   <SessionUpdatesProvider>
                     <RunnerHealthProvider>
-                      <App />
+                      <QueueFlushProvider>
+                        <App />
+                      </QueueFlushProvider>
                     </RunnerHealthProvider>
                   </SessionUpdatesProvider>
                 </BrowserRouter>

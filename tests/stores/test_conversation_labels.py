@@ -220,7 +220,7 @@ def test_labels_survive_item_compaction_proxy(
     # not reach past the public API.
     from sqlalchemy import delete
 
-    with conversation_store._session() as session:
+    with conversation_store._session("test_setup") as session:
         session.execute(
             delete(SqlConversationItem).where(
                 SqlConversationItem.conversation_id == conv.id,
@@ -261,7 +261,7 @@ async def test_delete_conversation_cascades_to_labels(
 
     from omnigent.db.db_models import SqlConversationLabel
 
-    with conversation_store._session() as session:
+    with conversation_store._session("test_setup") as session:
         count = session.execute(
             select(func.count())
             .select_from(SqlConversationLabel)
@@ -306,7 +306,7 @@ def test_get_conversation_missing_returns_none(
     """get_conversation on a non-existent ID returns None,
     not a zero-value Conversation. Must not attempt the
     label fetch for a missing parent (no SELECT error)."""
-    got = conversation_store.get_conversation("conv_does_not_exist")
+    got = conversation_store.get_conversation("1d0b12236c77f69f5073a53583de1a3f")
     assert got is None
 
 
@@ -377,7 +377,7 @@ def test_set_labels_honors_caller_timestamp(
     conv = conversation_store.create_conversation()
     caller_stamp = 1_700_000_042  # arbitrary historical epoch
     conversation_store.set_labels(conv.id, {"integrity": "1"}, updated_at=caller_stamp)
-    with conversation_store._session() as session:
+    with conversation_store._session("test_setup") as session:
         row = session.execute(
             select(SqlConversationLabel.updated_at).where(
                 SqlConversationLabel.conversation_id == conv.id,
@@ -424,7 +424,7 @@ def test_upsert_refreshes_timestamp_on_overwrite(
         {"x": "2"},
         updated_at=second_stamp,
     )
-    with conversation_store._session() as session:
+    with conversation_store._session("test_setup") as session:
         stamp = session.execute(
             select(SqlConversationLabel.updated_at).where(
                 SqlConversationLabel.conversation_id == conv.id,

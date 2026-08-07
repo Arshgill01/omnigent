@@ -12,7 +12,8 @@ import time
 import uuid
 from importlib.resources import files
 from pathlib import Path
-from typing import Any
+
+from omnigent.json_types import JsonObject as _JsonObject
 
 # Per-process tiebreaker for inbox ordering. The extension delivers inbox
 # files in lexicographic filename order, so a high-resolution timestamp alone
@@ -30,6 +31,11 @@ _EXTENSION_FILE = "omnigent_pi_native_extension.js"
 _EXTENSION_PACKAGE = "omnigent.resources.pi_native"
 _INBOX_DIR = "inbox"
 _SESSIONS_DIR = "sessions"
+
+
+def bridge_root() -> Path:
+    """Return the root directory used for native Pi bridge files."""
+    return _BRIDGE_ROOT
 
 
 def bridge_dir_for_session_id(session_id: str) -> Path:
@@ -127,7 +133,7 @@ def enqueue_user_message(bridge_dir: Path, content: str) -> str:
     :returns: Opaque message id.
     """
     message_id = f"msg_{uuid.uuid4().hex}"
-    payload = {
+    payload: _JsonObject = {
         "id": message_id,
         "type": "user_message",
         "content": content,
@@ -150,7 +156,7 @@ def enqueue_interrupt(bridge_dir: Path) -> str:
     :returns: Opaque interrupt id.
     """
     interrupt_id = f"interrupt_{uuid.uuid4().hex}"
-    payload = {
+    payload: _JsonObject = {
         "id": interrupt_id,
         "type": "interrupt",
         "created_at": time.time(),
@@ -179,7 +185,7 @@ def enqueue_compact(bridge_dir: Path, custom_instructions: str | None = None) ->
     :returns: Opaque compact id.
     """
     compact_id = f"compact_{uuid.uuid4().hex}"
-    payload: dict[str, Any] = {
+    payload: _JsonObject = {
         "id": compact_id,
         "type": "compact",
         "created_at": time.time(),
@@ -190,7 +196,34 @@ def enqueue_compact(bridge_dir: Path, custom_instructions: str | None = None) ->
     return compact_id
 
 
-def _enqueue_payload(bridge_dir: Path, item_id: str, payload: dict[str, Any]) -> None:
+def enqueue_model_change(bridge_dir: Path, model: str) -> str:
+    """
+    Queue a UI-originated model switch for the resident Pi extension.
+
+    Pi owns the active model inside the already-open TUI process, so a
+    web-picked model must be applied there rather than at the next spawn's
+    ``--model`` arg (which would only take effect on relaunch). Mirrors
+    :func:`enqueue_compact`: the extension consumes this inbox payload in the
+    Pi process, resolves *model* against ``ctx.modelRegistry`` and calls Pi's
+    ``setModel`` — taking effect immediately, no ``/reload`` required.
+
+    :param bridge_dir: Native Pi bridge directory.
+    :param model: Model id to switch to, e.g.
+        ``"databricks-claude-sonnet-4-6"``.
+    :returns: Opaque model-change id.
+    """
+    model_change_id = f"model_change_{uuid.uuid4().hex}"
+    payload: _JsonObject = {
+        "id": model_change_id,
+        "type": "model_change",
+        "model": model,
+        "created_at": time.time(),
+    }
+    _enqueue_payload(bridge_dir, model_change_id, payload)
+    return model_change_id
+
+
+def _enqueue_payload(bridge_dir: Path, item_id: str, payload: _JsonObject) -> None:
     inbox = bridge_dir / _INBOX_DIR
     inbox.mkdir(mode=0o700, parents=True, exist_ok=True)
     # Order-preserving filename. The extension polls ``inbox/*.json`` and
@@ -221,7 +254,7 @@ def write_extension_files(
     server_url: str,
     conversation_url: str,
     auth_headers: dict[str, str] | None = None,
-    tools: list[dict[str, Any]] | None = None,
+    tools: list[_JsonObject] | None = None,
 ) -> tuple[Path, Path]:
     """
     Write the Pi extension and config used by a native Pi terminal.
@@ -242,7 +275,7 @@ def write_extension_files(
     :returns: ``(extension_path, config_path)``.
     """
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    payload: dict[str, Any] = {
+    payload: _JsonObject = {
         "sessionId": session_id,
         "serverUrl": server_url.rstrip("/"),
         "conversationUrl": conversation_url,
@@ -258,7 +291,7 @@ def write_extension_files(
 
 def refresh_config_auth_headers(bridge_dir: Path, auth_headers: dict[str, str]) -> bool:
     """
-    Rewrite only the ``authHeaders`` of an existing extension config.
+    Merge fresh headers into the ``authHeaders`` of an existing extension config.
 
     The bearer baked into ``config.json`` at launch dies with the ~1h
     Databricks OAuth lifetime. The resident extension re-reads the config on
@@ -268,12 +301,17 @@ def refresh_config_auth_headers(bridge_dir: Path, auth_headers: dict[str, str]) 
     Best-effort and behavior-preserving: it touches only ``authHeaders``,
     leaving ``serverUrl`` / ``tools`` / etc. intact.
 
+    Headers are **merged** (fresh values win on collision) rather than replaced,
+    so launch-written headers such as ``X-Omnigent-Runner-Tunnel-Token`` — set
+    when the binding token was available in the runner-main process env and
+    needed for guest-on-shared-host self-access — survive every bearer rotation.
+
     :param bridge_dir: Native Pi bridge directory.
-    :param auth_headers: Fresh outbound auth headers, e.g.
+    :param auth_headers: Fresh outbound auth headers to merge in, e.g.
         ``{"Authorization": "Bearer <token>"}``.
     :returns: ``True`` when the config was rewritten; ``False`` when
         *auth_headers* is empty (local/unauthenticated), the config is
-        missing/unreadable, or the headers already match.
+        missing/unreadable, or the merged result is unchanged.
     """
     if not auth_headers:
         return False
@@ -282,9 +320,37 @@ def refresh_config_auth_headers(bridge_dir: Path, auth_headers: dict[str, str]) 
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
-    if not isinstance(payload, dict) or payload.get("authHeaders") == auth_headers:
+    if not isinstance(payload, dict):
         return False
-    payload["authHeaders"] = auth_headers
+    existing = payload.get("authHeaders") or {}
+    merged = {**existing, **auth_headers}
+    if merged == existing:
+        return False
+    payload["authHeaders"] = merged
+    _atomic_json(path, payload)
+    return True
+
+
+def inject_relay_into_config(bridge_dir: Path, relay_url: str, relay_token: str) -> bool:
+    """Write ``relayUrl`` and ``relayToken`` into ``config.json``.
+
+    The pi extension reads these on every policy POST via ``relayCredentials()``
+    and routes to the relay instead of the server — eliminating server bearer
+    expiry for policy evaluation.
+
+    :returns: ``True`` when the config was updated.
+    """
+    path = config_path(bridge_dir)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("relayUrl") == relay_url and payload.get("relayToken") == relay_token:
+        return False
+    payload["relayUrl"] = relay_url
+    payload["relayToken"] = relay_token
     _atomic_json(path, payload)
     return True
 
@@ -300,7 +366,7 @@ def _extension_source() -> str:
     return resource.read_text(encoding="utf-8")
 
 
-def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+def _atomic_json(path: Path, payload: _JsonObject) -> None:
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:

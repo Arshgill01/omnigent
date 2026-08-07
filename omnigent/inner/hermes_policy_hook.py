@@ -54,6 +54,13 @@ def main() -> None:
     tool_name = payload.get("tool_name") or "unknown"
     tool_input = payload.get("tool_input") or {}
 
+    # Omnigent relay tools are already gated when the relay dispatches them back
+    # through the server's tool path; gating them here too parks a duplicate approval
+    # card whose long-poll hangs. Hermes' own tools lack the prefix and stay gated.
+    if tool_name.startswith(("mcp_omnigent_", "mcp__omnigent__")):
+        json.dump({}, sys.stdout)
+        return
+
     # Build the evaluation request matching the server's EvaluationRequest
     # schema.
     eval_body: dict[str, object] = {
@@ -68,36 +75,53 @@ def main() -> None:
         },
     }
 
-    url = f"{server_url.rstrip('/')}/v1/sessions/{session_id}/policies/evaluate"
-
     try:
         from omnigent.native_policy_hook import (
+            _RELAY_TOKEN_ENV,
+            _RELAY_URL_ENV,
             policy_hook_reauth,
             policy_hook_request_headers,
             post_evaluate_with_retry,
+            relay_policy_evaluate_url,
         )
 
-        headers = policy_hook_request_headers()
-        resp = post_evaluate_with_retry(
+        relay_url = os.environ.get(_RELAY_URL_ENV, "")
+        relay_token = os.environ.get(_RELAY_TOKEN_ENV, "")
+        if relay_url and relay_token:
+            url = relay_policy_evaluate_url(relay_url)
+            headers: dict[str, str] = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {relay_token}",
+            }
+            reauth = None
+        else:
+            url = f"{server_url.rstrip('/')}/v1/sessions/{session_id}/policies/evaluate"
+            headers = policy_hook_request_headers()
+            reauth = policy_hook_reauth(server_url, headers)
+
+        resp, api_error = post_evaluate_with_retry(
             url=url,
             headers=headers,
             eval_request=eval_body,
-            # One day — must match the server's ``ask_timeout`` so the hook
-            # stays alive while the human responds to the web-UI approval card.
             read_timeout=86400.0,
             hook_label="hermes pre_tool_call",
-            # Re-mint the baked one-shot token if it lapses mid-session.
-            reauth=policy_hook_reauth(server_url, headers),
+            reauth=reauth,
         )
     except Exception:  # noqa: BLE001 -- fail open on import / unexpected error
         json.dump({}, sys.stdout)
         return
 
     if resp is None:
-        # Network error / retry budget exhausted -- fail closed so a
-        # transient server outage doesn't let unreviewed tools through.
+        detail = api_error or (reauth.failure_reason if reauth else None)
         json.dump(
-            {"decision": "block", "reason": "Policy evaluation unavailable"},
+            {
+                "decision": "block",
+                "reason": (
+                    f"Policy evaluation unavailable: {detail}"
+                    if detail
+                    else "Policy evaluation unavailable"
+                ),
+            },
             sys.stdout,
         )
         return

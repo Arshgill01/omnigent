@@ -31,6 +31,7 @@ import httpx
 import pytest
 import yaml
 
+from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.conftest import (
     POLL_INTERVAL_S,
@@ -91,7 +92,9 @@ def _spawn_host_daemon(
     """
     omni_dir = tmp_path / ".omnigent"
     omni_dir.mkdir(parents=True, exist_ok=True)
-    host_id = f"host_{uuid.uuid4().hex}"
+    # Bare 32-char hex — host_id is a Uuid16 column, and the API returns the
+    # bare form, so _wait_for_host_online's comparison must see the same.
+    host_id = uuid.uuid4().hex
     host_name = f"e2e-host-{uuid.uuid4().hex[:12]}"
     (omni_dir / "config.yaml").write_text(
         yaml.safe_dump(
@@ -100,16 +103,16 @@ def _spawn_host_daemon(
             sort_keys=True,
         )
     )
+    # Route process logs to a deterministic file so tests can read the
+    # "Launched runner ... (pid=NNNN)" line and inspect it on failure.
+    daemon_log = tmp_path / "host-daemon.log"
     env = {
         **os.environ,
         "HOME": str(tmp_path),
         "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
         "OPENAI_API_KEY": "mock-key",
+        PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),
     }
-    # Capture the daemon's stderr to a file so tests can read the
-    # "Launched runner ... (pid=NNNN)" line (and inspect it on failure).
-    # The child keeps its own dup of the fd after this handle is closed.
-    daemon_log = tmp_path / "host-daemon.log"
     with open(daemon_log, "w") as log_fh:
         proc = subprocess.Popen(
             # Compat-aware: pinned OLD host venv in runner compat mode (Config 2),
@@ -360,6 +363,103 @@ def test_host_launch_runner_and_session_round_trip(
         assert body["status"] == "completed", f"Session failed: {body.get('error')}"
         text = final_assistant_text(body)
         assert marker in text, f"Marker {marker!r} missing from response: {text!r}"
+
+    finally:
+        host_proc.send_signal(signal.SIGTERM)
+        try:
+            host_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            host_proc.kill()
+            host_proc.wait()
+
+
+@pytest.mark.skipif(
+    shutil.which("goose") is not None,
+    reason="needs the goose CLI ABSENT so the native terminal start fails",
+)
+def test_native_terminal_start_failure_names_the_readable_runner_log(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+    mock_llm_server_url: str,
+) -> None:
+    """
+    A failed native terminal start tells the user which log holds the cause.
+
+    ``omnigent codex`` (and its siblings) surface the runner's message
+    verbatim, so "see runner logs for details" left the user hunting for a
+    file whose name they could not know. The runner names its own log file
+    instead. This asserts the path is not just present but *real*: the file
+    it names exists and carries the raw cause that the client-safe message
+    deliberately withholds.
+
+    Goose stands in for any native harness whose CLI is missing — the same
+    ``ImportError``/``ClickException`` path the reported codex failure took.
+    """
+    daemon = _spawn_host_daemon(
+        tmp_path=tmp_path,
+        live_server=live_server,
+        mock_llm_server_url=mock_llm_server_url,
+    )
+    host_proc = daemon.proc
+    host_id = daemon.host_id
+
+    try:
+        _wait_for_host_online(http_client, host_id, timeout=30.0)
+
+        agent_id = lookup_agent_id(
+            http_client,
+            upload_agent(http_client, _write_smoke_agent_yaml(tmp_path)),
+        )
+        resp = http_client.post("/v1/sessions", json={"agent_id": agent_id})
+        resp.raise_for_status()
+        session_id = resp.json()["id"]
+
+        launch_resp = http_client.post(
+            f"/v1/hosts/{host_id}/runners",
+            json={"session_id": session_id, "workspace": str(tmp_path)},
+            timeout=60.0,
+        )
+        launch_resp.raise_for_status()
+        runner_id = launch_resp.json()["runner_id"]
+
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            status_resp = http_client.get(f"/v1/runners/{runner_id}/status")
+            if status_resp.status_code == 200 and status_resp.json().get("online") is True:
+                break
+            time.sleep(POLL_INTERVAL_S)
+        else:
+            raise AssertionError(f"Runner {runner_id} never came online after launch")
+
+        http_client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"runner_id": runner_id},
+        ).raise_for_status()
+
+        ensure_resp = http_client.post(
+            f"/v1/sessions/{session_id}/resources/terminals",
+            json={"terminal": "goose", "session_key": "main", "ensure_native_terminal": True},
+            timeout=90.0,
+        )
+        assert ensure_resp.status_code >= 400, (
+            f"expected the goose terminal start to fail, got {ensure_resp.status_code}: "
+            f"{ensure_resp.text}"
+        )
+        message = ensure_resp.json()["error"]["message"]
+        assert "Native Goose terminal failed to start" in message, message
+
+        # The daemon runs with HOME=tmp_path, so the runner's home-relative
+        # path resolves back under the test's temp dir.
+        named_path = message.rsplit(": ", 1)[-1]
+        assert named_path.endswith(".log"), f"message names no log file: {message!r}"
+        runner_log = tmp_path / named_path[2:] if named_path.startswith("~/") else Path(named_path)
+        assert runner_log.exists(), (
+            f"message named {named_path!r} but no such log exists (resolved {runner_log})"
+        )
+        # The message stays free of the raw cause; the named log carries it.
+        assert "requires the 'goose' CLI" not in message
+        assert "requires the 'goose' CLI" in runner_log.read_text()
 
     finally:
         host_proc.send_signal(signal.SIGTERM)
@@ -681,7 +781,9 @@ def _spawn_host_daemon_for_mock_claude(
     """
     omni_dir = tmp_path / ".omnigent"
     omni_dir.mkdir(parents=True, exist_ok=True)
-    host_id = f"host_{uuid.uuid4().hex}"
+    # Bare 32-char hex — host_id is a Uuid16 column, and the API returns the
+    # bare form, so _wait_for_host_online's comparison must see the same.
+    host_id = uuid.uuid4().hex
     host_name = f"e2e-host-{uuid.uuid4().hex[:12]}"
     (omni_dir / "config.yaml").write_text(
         yaml.safe_dump(
@@ -690,6 +792,7 @@ def _spawn_host_daemon_for_mock_claude(
             sort_keys=True,
         )
     )
+    daemon_log = tmp_path / "host-daemon.log"
     env = {
         **os.environ,
         "HOME": str(tmp_path),
@@ -701,8 +804,8 @@ def _spawn_host_daemon_for_mock_claude(
         "ANTHROPIC_API_KEY": "mock-key",
         # Suppress beta headers so the mock server doesn't reject them.
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+        PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),
     }
-    daemon_log = tmp_path / "host-daemon.log"
     with open(daemon_log, "w") as log_fh:
         proc = subprocess.Popen(
             # Compat-aware: pinned OLD host venv in runner compat mode (Config 2),
