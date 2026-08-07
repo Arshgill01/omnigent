@@ -24,7 +24,7 @@ from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TypeAlias, TypedDict
+from typing import Any, TypeAlias, TypedDict
 from urllib.parse import quote
 
 import httpx
@@ -281,10 +281,11 @@ class OpenCodeNativeForwarder:
             info = message.get("info")
             message_id = info.get("id") if isinstance(info, Mapping) else None
             role = info.get("role") if isinstance(info, Mapping) else None
+            info_map = info if isinstance(info, Mapping) else None
             if isinstance(message_id, str) and isinstance(role, str):
                 self._msg_role[message_id] = role
-                if role == "assistant":
-                    self._record_assistant_usage(message_id, info)
+                if role == "assistant" and info_map is not None:
+                    self._record_assistant_usage(message_id, info_map)
             parts = message.get("parts")
             if not isinstance(parts, list):
                 continue
@@ -304,7 +305,7 @@ class OpenCodeNativeForwarder:
                     await self._handle_tool_part(part)
                 elif part_type == "file":
                     await self._handle_file_part(part)
-            if role == "assistant" and _message_is_complete(info):
+            if role == "assistant" and _message_is_complete(info_map):
                 await self._flush_pending_text()
         try:
             await self._post_session_usage()
