@@ -404,6 +404,11 @@ export interface ChatState {
    */
   codexPlanMode: boolean;
   /**
+   * Per-session permission mode for the active session (e.g. "default", "acceptEdits").
+   * Hydrated from the session snapshot on bind and written through `setPermissionMode`.
+   */
+  permissionMode: string | null;
+  /**
    * True when older items exist before the loaded history window. Binds
    * hydrate only the most recent page (see `fetchSessionItemsPage`);
    * scroll-up `loadMoreHistory` pages older until this goes false.
@@ -671,6 +676,12 @@ export interface ChatState {
    * active conversation.
    */
   setCodexPlanMode: (enabled: boolean) => Promise<void>;
+  /**
+   * Set the active session's permission mode — optimistic local flip,
+   * then PATCH; the server's canonical value (or a rollback on failure)
+   * settles the state.
+   */
+  setPermissionMode: (mode: string) => Promise<void>;
   /**
    * Fetch the next page of older messages and prepend them to `blocks`.
    *
@@ -1059,6 +1070,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   costControlModeOverride: null,
   subagentRoutingOverride: null,
   codexPlanMode: false,
+  permissionMode: null,
   hasMoreHistory: false,
   loadingMoreHistory: false,
   oldestItemId: null,
@@ -1776,6 +1788,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         costControlModeOverride: null,
         subagentRoutingOverride: null,
         codexPlanMode: false,
+        permissionMode: null,
         contextWindow: null,
         tokensUsed: null,
         sessionCostUsd: null,
@@ -2018,6 +2031,23 @@ export const useChatStore = create<ChatState>((set, get) => ({
     } catch (err) {
       if (get().conversationId === conversationId) {
         set({ codexPlanMode: previous });
+      }
+      throw err;
+    }
+  },
+
+  setPermissionMode: async (mode) => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    const previous = get().permissionMode;
+    set({ permissionMode: mode });
+    try {
+      const session = await updateSession(conversationId, { permissionMode: mode });
+      if (get().conversationId !== conversationId) return;
+      set({ permissionMode: session.permissionMode ?? null });
+    } catch (err) {
+      if (get().conversationId === conversationId) {
+        set({ permissionMode: previous });
       }
       throw err;
     }
@@ -2320,6 +2350,7 @@ function sessionBindingPatch(
   | "boundAgentName"
   | "llmModel"
   | "sessionModelOverride"
+  | "permissionMode"
   | "sessionHarness"
   | "subAgentName"
   | "costControlModeOverride"
@@ -2345,6 +2376,7 @@ function sessionBindingPatch(
     boundAgentName: session.agentName,
     llmModel: session.llmModel ?? null,
     sessionModelOverride: session.modelOverride ?? null,
+    permissionMode: session.permissionMode ?? null,
     sessionHarness: session.harness ?? null,
     subAgentName: session.subAgentName ?? null,
     costControlModeOverride: session.costControlModeOverride ?? null,

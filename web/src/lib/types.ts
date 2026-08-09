@@ -308,6 +308,7 @@ export interface Session {
    * so the surfaces stay in sync.
    */
   modelOverride?: string | null;
+  permissionMode?: string | null;
   /**
    * Per-session cost-control switch: `"on"` activates the spec's
    * configured cost-control mode, `"off"` disables cost control for

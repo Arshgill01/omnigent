@@ -180,7 +180,10 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import {
+  CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
+  CLAUDE_NATIVE_PERMISSION_MODES,
   ConfigRow,
+  DescribedSelect,
   EFFORT_SELECT_NONE,
   EFFORT_UNAVAILABLE_PLACEHOLDER,
   MODEL_SELECT_DEFAULT,
@@ -5875,15 +5878,15 @@ const SUBAGENT_ROUTING_DESCRIPTION = "Model routing for subagents this session s
  * In-session run-config modal opened from the composer's gear icon. The
  * live-committing analogue of the new-session ``HarnessConfigModal``: only the
  * knobs switchable mid-session appear — Model (which folds Smart Routing in as
- * an option where a dropdown exists), Effort, and Subagent routing. A session's
- * own Smart Routing is otherwise a create-time choice, and
- * permission/approval/cursor modes are launch-time only (no in-session state to
- * read or write), so they are intentionally absent.
+ * an option where a dropdown exists), Effort, Claude permissions, and Subagent
+ * routing. A session's own Smart Routing is otherwise a create-time choice;
+ * approval/cursor modes remain launch-time only.
  *
  * Like the new-session modal, changes are drafted locally and only applied on
  * Save (through the store setters ``setModel`` / ``setEffort`` /
- * ``setCostControlMode`` / ``setSubagentRouting``); Cancel / dismiss discards
- * them. The setters enforce the model↔routing mutual exclusion server-side.
+ * ``setPermissionMode`` / ``setCostControlMode`` / ``setSubagentRouting``);
+ * Cancel / dismiss discards them. The setters enforce the model↔routing mutual
+ * exclusion server-side.
  */
 function SessionConfigModal({
   open,
@@ -5909,6 +5912,7 @@ function SessionConfigModal({
   subagentRoutingEligible: boolean;
 }) {
   const selectedEffort = useChatStore((s) => s.selectedEffort);
+  const permissionMode = useChatStore((s) => s.permissionMode);
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
   const conversationId = useChatStore((s) => s.conversationId);
@@ -5938,6 +5942,9 @@ function SessionConfigModal({
   // `draftRoutingOn` folds Smart Routing in as a mutually-exclusive choice.
   const [draftModelId, setDraftModelId] = useState<string | null>(resolvedModelId);
   const [draftEffort, setDraftEffort] = useState<string | null>(selectedEffort);
+  const [draftPermissionMode, setDraftPermissionMode] = useState(
+    permissionMode ?? CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
+  );
   const [draftRoutingOn, setDraftRoutingOn] = useState(liveRoutingOn);
   // The sub-agent row is stored as a PICK, not a pre-seeded draft:
   // `undefined` means "untouched", so the row mirrors the live stored value for
@@ -5952,6 +5959,7 @@ function SessionConfigModal({
     if (!open) return;
     setDraftModelId(resolvedModelId);
     setDraftEffort(selectedEffort);
+    setDraftPermissionMode(permissionMode ?? CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE);
     setDraftRoutingOn(liveRoutingOn);
     setPickedSubagentRouting(undefined);
     // Nothing pushes a routing-switch change to the client (no SSE event, and
@@ -6024,6 +6032,11 @@ function SessionConfigModal({
         // stray ``/effort`` injection would just be noise.
         if (showEffort && !draftRoutingOn && draftEffort !== selectedEffort)
           await store.setEffort(draftEffort);
+        if (
+          modelPickerKind === "claude" &&
+          draftPermissionMode !== (permissionMode ?? CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE)
+        )
+          await store.setPermissionMode(draftPermissionMode);
         // Sub-agent routing is independent of this session's own model — a
         // plain PATCH with no slash-command injection, so ordering is free.
         // Only an explicit pick is written, and only when it still differs from
@@ -6068,7 +6081,8 @@ function SessionConfigModal({
         <DialogHeader>
           <DialogTitle>Configure {harnessLabel ?? "session"}</DialogTitle>
           <DialogDescription className="sr-only">
-            Change how this session runs. Model, effort, and smart routing apply to the next turn.
+            Change how this session runs. Model, effort, permissions, and smart routing apply to the
+            next turn.
           </DialogDescription>
         </DialogHeader>
 
@@ -6122,6 +6136,17 @@ function SessionConfigModal({
                   ))}
                 </SelectContent>
               </Select>
+            </ConfigRow>
+          )}
+          {modelPickerKind === "claude" && (
+            <ConfigRow label="Permissions" description="What the agent can do without asking">
+              <DescribedSelect
+                value={draftPermissionMode}
+                onValueChange={setDraftPermissionMode}
+                options={CLAUDE_NATIVE_PERMISSION_MODES}
+                testId="composer-config-permission"
+                ariaLabel="Permissions"
+              />
             </ConfigRow>
           )}
           {/* Sub-agent routing — the only in-session routing control, for a
@@ -6179,8 +6204,8 @@ function SessionConfigModal({
 /**
  * Composer gear affordance: a ghost `SettingsIcon` that shows the session's
  * live run-config on hover and opens `SessionConfigModal` on click. Rendered
- * only when the session has at least one switchable knob (model, effort, or
- * smart routing) — otherwise there's nothing to configure.
+ * only when the session has at least one switchable knob (model, effort,
+ * permissions, or smart routing) — otherwise there's nothing to configure.
  *
  * @param openNonce External "open the modal" signal, nonce-keyed so repeat
  *   requests re-open (bare ``/model`` submits route here now that the composer
@@ -6229,7 +6254,14 @@ function ComposerConfigGear({
     costRoutingEligible,
   });
 
-  if (!showModels && !showEffort && !costRoutingEligible && !subagentRoutingEligible) return null;
+  if (
+    !showModels &&
+    !showEffort &&
+    !costRoutingEligible &&
+    !subagentRoutingEligible &&
+    modelPickerKind !== "claude"
+  )
+    return null;
 
   return (
     <>
@@ -6296,9 +6328,8 @@ function ComposerConfigGear({
 }
 
 /**
- * Label/value rows summarizing the session's live run-config, for the gear
- * icon's hover tooltip. Mirrors the new-session summary but with in-session
- * values and no Permissions row (permission mode is launch-time only).
+ * Label/value rows summarizing the session's live run-config for the gear
+ * icon's hover tooltip.
  */
 function useSessionConfigSummary({
   harnessLabel,
@@ -6316,6 +6347,7 @@ function useSessionConfigSummary({
   costRoutingEligible: boolean;
 }): { label: string; value: string }[] {
   const selectedEffort = useChatStore((s) => s.selectedEffort);
+  const permissionMode = useChatStore((s) => s.permissionMode);
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const { modelLabel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
@@ -6333,6 +6365,12 @@ function useSessionConfigSummary({
   if (showEffort && !routingOn) {
     const effortValue = formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex");
     rows.push({ label: "Effort", value: effortValue ?? "Default" });
+  }
+  if (modelPickerKind === "claude") {
+    const permissionLabel = CLAUDE_NATIVE_PERMISSION_MODES.find(
+      (mode) => mode.value === (permissionMode ?? CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE),
+    )?.label;
+    rows.push({ label: "Permissions", value: permissionLabel ?? "Default" });
   }
   return rows;
 }
