@@ -198,6 +198,13 @@ _CLAUDE_MODEL_CONFIRM_POLL_S = 0.25
 _CLAUDE_MODEL_LATE_DIALOG_BUDGET_S = 1200.0
 _CLAUDE_MODEL_LATE_DIALOG_POLL_S = 2.0
 
+# After a stale-pane recreate the TUI boots with ``--resume``. Poll until
+# the input box is usable before typing a session-change slash command.
+# A live ready pane passes the first probe. Module-level so tests can
+# tighten the budget.
+_CLAUDE_SESSION_CHANGE_PANE_READY_TIMEOUT_S = 30.0
+_CLAUDE_SESSION_CHANGE_PANE_READY_POLL_S = 0.05
+
 
 def _warn_unresolved_sub_agent(session_id: str | None, sub_agent_name: str) -> None:
     """
@@ -4909,6 +4916,33 @@ def create_runner_app(
             )
         return JSONResponse(status_code=200, content={"permission_mode": settled})
 
+    async def _prepare_claude_native_pane_for_session_change(
+        conv_id: str,
+        bridge_dir: Path,
+    ) -> None:
+        """Heal a stale registered pane, then wait until slash injection can land.
+
+        ``_ensure_native_terminal_for_turn`` already probes ``is_alive()`` and
+        recreates a missing or dead registry entry. A live pane is a no-op.
+        After a recreate the TUI boots with ``--resume``, so we poll
+        ``claude_pane_ready`` before typing. A live ready pane passes the
+        first probe. No terminal registry means there is nothing to heal
+        (inject keeps its own short advertisement timeout).
+        """
+        from omnigent.claude_native_bridge import claude_pane_ready
+
+        terminal_registry = resource_registry.terminal_registry if resource_registry else None
+        if terminal_registry is None:
+            return
+        await _ensure_native_terminal_for_turn(conv_id, "claude-native")
+        if await asyncio.to_thread(claude_pane_ready, bridge_dir):
+            return
+        deadline = time.monotonic() + _CLAUDE_SESSION_CHANGE_PANE_READY_TIMEOUT_S
+        while time.monotonic() < deadline:
+            await asyncio.sleep(_CLAUDE_SESSION_CHANGE_PANE_READY_POLL_S)
+            if await asyncio.to_thread(claude_pane_ready, bridge_dir):
+                return
+
     async def _handle_claude_native_effort_change(
         conv_id: str,
         effort: str | None,
@@ -4927,6 +4961,7 @@ def create_runner_app(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        await _prepare_claude_native_pane_for_session_change(conv_id, bridge_dir)
         command = f"/effort {effort}"
         try:
             # An effort switch invalidates the prompt cache on a session with
@@ -5022,6 +5057,7 @@ def create_runner_app(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        await _prepare_claude_native_pane_for_session_change(conv_id, bridge_dir)
         selected_model = model.strip()
         claude_config = await _resolve_session_claude_launch_config(conv_id)
         resolved_model = (
