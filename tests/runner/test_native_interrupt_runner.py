@@ -77,6 +77,27 @@ def _make_runner(**overrides: Any) -> tuple[NativeInterruptRunner, dict[str, Any
     return NativeInterruptRunner(**kwargs), captured
 
 
+def test_native_cancel_capability_follows_stop_registry() -> None:
+    """Parent cancel capability must track ``_UNIFORM_STOP`` plus Claude."""
+    from omnigent.native_coding_agents import NATIVE_CODING_AGENTS
+    from omnigent.runner.native.interrupt import (
+        _UNIFORM_STOP,
+        native_cancel_capability,
+    )
+
+    for agent in NATIVE_CODING_AGENTS:
+        capability = native_cancel_capability(agent.wrapper_label)
+        if agent.key == "claude" or agent.key in _UNIFORM_STOP:
+            assert capability == "stop", agent.key
+        else:
+            assert capability == "best_effort", agent.key
+        if agent.subagent_wrapper_label:
+            assert native_cancel_capability(agent.subagent_wrapper_label) == capability
+
+    assert native_cancel_capability(None) == "inprocess"
+    assert native_cancel_capability("not-a-native-wrapper") == "inprocess"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("harness", ["antigravity-native", "opencode-native", "claude-sdk", None])
 async def test_no_handler_harnesses_return_none(harness: str | None) -> None:

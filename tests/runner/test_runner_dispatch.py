@@ -5093,12 +5093,10 @@ async def test_sys_cancel_task_reports_codex_native_cancel_as_best_effort() -> N
     """
     Unconfirmed codex-native cancel must not promise terminal inbox status.
 
-    Codex-native has no runner-side hard-stop path, so the cancel routes to
-    ``interrupt`` (not ``stop_session``, which the runner 204 no-ops for every
-    non-claude-native harness). For codex-native that interrupt is itself a
-    best-effort no-op — the child can remain running after the POST returns —
-    so the tool result must say cancellation is best-effort instead of telling
-    the parent to wait forever for a terminal inbox item.
+    Codex-native has no runner-side hard-stop path (stop aliases to
+    interrupt), so the cancel routes to ``interrupt`` and the tool result
+    must say cancellation is best-effort instead of telling the parent to
+    wait forever for a terminal inbox item.
     """
     from omnigent.runner import app as runner_app
     from omnigent.runner.tool_dispatch import execute_tool
@@ -5143,8 +5141,7 @@ async def test_sys_cancel_task_reports_codex_native_cancel_as_best_effort() -> N
     finally:
         runner_app.unregister_subagent_work(child_id)
 
-    # codex-native routes to interrupt, not stop_session (which the runner
-    # 204 no-ops for non-claude-native harnesses). ``data`` rides along for
+    # Codex-native routes to interrupt; ``data`` rides along for
     # SessionEventInput compatibility with older servers.
     assert stops == [{"type": "interrupt", "data": {}}]
     assert cancel_output == {
@@ -5154,9 +5151,9 @@ async def test_sys_cancel_task_reports_codex_native_cancel_as_best_effort() -> N
         "task_id": child_id,
         "status": "launching",
         "message": (
-            "Interrupt forwarded, but a runner-side hard-stop is not wired "
-            "for codex-native workers yet; the child may keep running and no "
-            "terminal inbox status is guaranteed."
+            "Interrupt forwarded, but no runner-side hard-stop is wired for "
+            "this harness; the child may keep running and no terminal inbox "
+            "status is guaranteed."
         ),
     }
 
@@ -5218,8 +5215,8 @@ async def test_sys_cancel_task_interrupts_non_native_subagent() -> None:
         runner_app.unregister_subagent_work(child_id)
 
     # The regression guard: a non-native child must route to interrupt, never
-    # the stop_session that the runner no-ops for non-claude-native harnesses.
-    # ``data`` rides along for SessionEventInput compatibility with older servers.
+    # ``stop_session``. ``data`` rides along for SessionEventInput compatibility
+    # with older servers.
     assert posts == [{"type": "interrupt", "data": {}}]
     # Not codex → generic (non-best-effort) pending result; the terminal
     # status will arrive on the inbox once the interrupted turn ends.
@@ -5236,13 +5233,21 @@ async def test_sys_cancel_task_interrupts_non_native_subagent() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sys_cancel_task_stops_terminal_claude_native_entry() -> None:
+async def test_sys_cancel_task_stops_terminal_claude_native_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A failed work status does not block cleanup of a live Claude pane."""
     from omnigent.runner import app as runner_app
     from omnigent.runner.tool_dispatch import _cancel_subagent_task
 
     parent_id = "conv_parent_terminal"
     child_id = "conv_child_terminal"
+    _install_cancel_pane(
+        monkeypatch,
+        wrapper_label="claude-code-native-ui",
+        task_id=child_id,
+        alive=True,
+    )
     entry = runner_app.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
@@ -5386,6 +5391,368 @@ async def test_sys_cancel_task_rejects_foreign_evicted_entry() -> None:
 
     assert posts == []
     assert output == f"Error: no in-flight task with task_id {child_id}"
+
+
+class _CancelPane:
+    """Stand-in pane whose ``is_alive`` answer is fixed for the cancel matrix."""
+
+    def __init__(self, alive: bool) -> None:
+        self.alive = alive
+        self.probed = 0
+
+    async def is_alive(self) -> bool:
+        self.probed += 1
+        return self.alive
+
+
+class _CancelPaneRegistry:
+    """Registry that returns one pane for the expected native ``main`` slot."""
+
+    def __init__(self, pane: _CancelPane | None, terminal_name: str, task_id: str) -> None:
+        self.pane = pane
+        self.terminal_name = terminal_name
+        self.task_id = task_id
+
+    def get(
+        self, conversation_id: str, terminal_name: str, session_key: str
+    ) -> _CancelPane | None:
+        if (
+            conversation_id == self.task_id
+            and terminal_name == self.terminal_name
+            and session_key == "main"
+        ):
+            return self.pane
+        return None
+
+
+def _install_cancel_pane(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    wrapper_label: str,
+    task_id: str,
+    alive: bool | None,
+) -> _CancelPane | None:
+    """Install a fake terminal registry for one native child's ``main`` pane."""
+    from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
+
+    agent = native_coding_agent_for_wrapper_label(wrapper_label)
+    assert agent is not None, f"unknown wrapper {wrapper_label!r}"
+    pane = None if alive is None else _CancelPane(alive)
+    registry = _CancelPaneRegistry(pane, agent.terminal_name, task_id)
+
+    def _get_registry() -> _CancelPaneRegistry:
+        return registry
+
+    monkeypatch.setattr("omnigent.runtime.get_terminal_registry", _get_registry)
+    monkeypatch.setattr(
+        "omnigent.runner.tool_dispatch.get_terminal_registry",
+        _get_registry,
+        raising=False,
+    )
+    return pane
+
+
+async def _drive_cancel_matrix_row(
+    *,
+    parent_id: str,
+    child_id: str,
+    wrapper_label: str | None,
+    status: str,
+    http_status: int,
+    evicted: bool,
+    requesting_parent: str,
+) -> tuple[list[dict[str, Any]], Any]:
+    """Run ``_cancel_subagent_task`` for one matrix row and return posts + output."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import _cancel_subagent_task
+
+    if not evicted:
+        entry = runner_app.register_subagent_work(
+            parent_session_id=parent_id,
+            child_session_id=child_id,
+            agent="matrix_impl",
+            title="native",
+            wrapper_label=wrapper_label,
+        )
+        entry.status = status
+    posts: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{child_id}":
+            return httpx.Response(
+                200,
+                json={
+                    "id": child_id,
+                    "parent_session_id": parent_id,
+                    "labels": {"omnigent.wrapper": wrapper_label},
+                },
+            )
+        body = json.loads(request.content)
+        posts.append(body)
+        if http_status == 503:
+            return httpx.Response(503, json={"error": "native_stop_failed"})
+        if not evicted and body.get("type") == "stop_session":
+            updated = runner_app.get_subagent_work(child_id)
+            if updated is not None:
+                updated.status = "cancelled"
+        return httpx.Response(http_status)
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            raw = await _cancel_subagent_task(
+                {"task_id": child_id},
+                conversation_id=requesting_parent,
+                server_client=server_client,
+            )
+    finally:
+        if not evicted:
+            runner_app.unregister_subagent_work(child_id)
+
+    try:
+        output: Any = json.loads(raw)
+    except json.JSONDecodeError:
+        output = raw
+    return posts, output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "row_id",
+        "wrapper_label",
+        "status",
+        "pane_alive",
+        "http_status",
+        "expect_event",
+        "expect_best_effort",
+        "expect_status",
+        "expect_cancelled",
+    ),
+    [
+        (
+            "claude_running_stop_session",
+            "claude-code-native-ui",
+            "running",
+            None,
+            204,
+            "stop_session",
+            False,
+            "running",
+            None,
+        ),
+        (
+            "goose_running_stop_session",
+            "goose-native-ui",
+            "running",
+            None,
+            204,
+            "stop_session",
+            False,
+            "running",
+            None,
+        ),
+        (
+            "opencode_running_best_effort",
+            "opencode-native-ui",
+            "running",
+            None,
+            204,
+            "interrupt",
+            True,
+            "running",
+            None,
+        ),
+        (
+            "antigravity_running_best_effort",
+            "antigravity-native-ui",
+            "running",
+            None,
+            204,
+            "interrupt",
+            True,
+            "running",
+            None,
+        ),
+        (
+            "failed_dead_pane_cached_failure",
+            "claude-code-native-ui",
+            "failed",
+            False,
+            503,
+            None,
+            False,
+            "failed",
+            False,
+        ),
+        (
+            "failed_live_pane_stop",
+            "goose-native-ui",
+            "failed",
+            True,
+            204,
+            "stop_session",
+            False,
+            "cancelled",
+            True,
+        ),
+        (
+            "failed_live_pane_503_falls_through",
+            "claude-code-native-ui",
+            "failed",
+            True,
+            503,
+            "stop_session",
+            False,
+            "failed",
+            False,
+        ),
+        (
+            "failed_opencode_cached",
+            "opencode-native-ui",
+            "failed",
+            None,
+            204,
+            None,
+            False,
+            "failed",
+            False,
+        ),
+    ],
+    ids=[
+        "claude_running_stop_session",
+        "goose_running_stop_session",
+        "opencode_running_best_effort",
+        "antigravity_running_best_effort",
+        "failed_dead_pane_cached_failure",
+        "failed_live_pane_stop",
+        "failed_live_pane_503_falls_through",
+        "failed_opencode_cached",
+    ],
+)
+async def test_sys_cancel_task_native_harness_cancel_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+    row_id: str,
+    wrapper_label: str,
+    status: str,
+    pane_alive: bool | None,
+    http_status: int,
+    expect_event: str | None,
+    expect_best_effort: bool,
+    expect_status: str,
+    expect_cancelled: bool | None,
+) -> None:
+    """Parent cancel must follow the native stop registry, not a Claude label.
+
+    Rows:
+    * ``claude_running_stop_session`` / ``goose_running_stop_session`` — both
+      stop-capable natives must POST ``stop_session``. On main, Goose is
+      routed to ``interrupt``.
+    * ``opencode_running_best_effort`` / ``antigravity_running_best_effort`` —
+      no runner-side hard-stop; result is best-effort/unconfirmed, not a
+      fake kill.
+    * ``failed_dead_pane_cached_failure`` — a failed Claude entry whose pane
+      is gone must return the cached failure. Routing ``stop_session`` at a
+      dead pane answers 503; that must not replace the terminal status.
+    * ``failed_live_pane_stop`` — a failed Goose entry whose pane still
+      answers must POST ``stop_session``. On main, non-Claude failed entries
+      return cached status and never stop.
+    * ``failed_live_pane_503_falls_through`` — a live pane whose
+      ``stop_session`` returns 503 must still report the cached failure,
+      not the bridge error.
+    * ``failed_opencode_cached`` — a failed OpenCode entry stays cached;
+      there is no hard-stop to apply.
+    """
+    parent_id = f"conv_parent_{row_id}"
+    child_id = f"conv_child_{row_id}"
+    if pane_alive is not None:
+        _install_cancel_pane(
+            monkeypatch,
+            wrapper_label=wrapper_label,
+            task_id=child_id,
+            alive=pane_alive,
+        )
+    posts, output = await _drive_cancel_matrix_row(
+        parent_id=parent_id,
+        child_id=child_id,
+        wrapper_label=wrapper_label,
+        status=status,
+        http_status=http_status,
+        evicted=False,
+        requesting_parent=parent_id,
+    )
+    if expect_event is None:
+        assert posts == [], f"{row_id}: dead/absent pane must not POST a stop"
+        assert isinstance(output, dict)
+        assert output == {
+            "cancelled": expect_cancelled,
+            "task_id": child_id,
+            "status": expect_status,
+        }
+        assert not str(output).startswith("Error:")
+        return
+    assert posts == [{"type": expect_event, "data": {}}], (
+        f"{row_id}: expected {expect_event} , got {posts}"
+    )
+    assert isinstance(output, dict)
+    assert not str(output).startswith("Error:")
+    if expect_best_effort:
+        assert output.get("best_effort") is True, f"{row_id}: must be explicit best-effort"
+        assert output.get("cancel_confirmed") is False
+        assert output.get("task_id") == child_id
+        assert output.get("status") == expect_status
+        message = str(output.get("message", ""))
+        assert "hard-stop" in message
+        assert "may keep running" in message
+        return
+    if expect_cancelled is not None:
+        assert output == {
+            "cancelled": expect_cancelled,
+            "task_id": child_id,
+            "status": expect_status,
+        }
+        return
+    assert output.get("task_id") == child_id
+    assert output.get("status") in {expect_status, "cancelled"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("row_id", "requesting_parent", "expect_stop"),
+    [
+        ("evicted_goose_owned_stop", "conv_owner_evicted_goose", True),
+        ("evicted_goose_foreign_refused", "conv_someone_else", False),
+    ],
+    ids=["evicted_goose_owned_stop", "evicted_goose_foreign_refused"],
+)
+async def test_cancel_evicted_native_subagent_ownership_matrix(
+    row_id: str,
+    requesting_parent: str,
+    expect_stop: bool,
+) -> None:
+    """Evicted-work recovery keeps the parent ownership check for every stop-capable native."""
+    owner = "conv_owner_evicted_goose"
+    child_id = f"conv_child_{row_id}"
+    posts, output = await _drive_cancel_matrix_row(
+        parent_id=owner,
+        child_id=child_id,
+        wrapper_label="goose-native-ui",
+        status="running",
+        http_status=204,
+        evicted=True,
+        requesting_parent=requesting_parent,
+    )
+    if expect_stop:
+        assert posts == [{"type": "stop_session", "data": {}}], (
+            f"{row_id}: owned Goose evicted work must hard-stop"
+        )
+        assert output == {"cancelled": True, "task_id": child_id, "status": "cancelled"}
+        return
+    assert posts == [], f"{row_id}: foreign parent must not stop the child"
+    assert isinstance(output, str)
+    assert output.startswith("Error:")
 
 
 def test_session_status_to_task_status_maps_known_values() -> None:
