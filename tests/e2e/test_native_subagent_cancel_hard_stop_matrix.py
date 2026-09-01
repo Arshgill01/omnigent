@@ -109,7 +109,7 @@ def _make_cancel_server(
 
 
 # ---------------------------------------------------------------------------
-# Facet 1 — active entry, uniform-stop harnesses send interrupt not stop_session
+# Facet 1 — active entry: uniform-stop harnesses must receive stop_session
 # ---------------------------------------------------------------------------
 
 
@@ -176,7 +176,7 @@ async def test_cancel_active_uniform_stop_harness_sends_stop_session(
 
 
 # ---------------------------------------------------------------------------
-# Facet 2 — evicted entry, non-claude-native harness returns "no task" error
+# Facet 2 — evicted entry: owned stop-capable natives must still be stoppable
 # ---------------------------------------------------------------------------
 
 
@@ -252,7 +252,7 @@ async def test_cancel_evicted_uniform_stop_harness_sends_stop_session(
 
 
 # ---------------------------------------------------------------------------
-# Facet 3 — failed entry, non-claude-native harness returns cached status
+# Facet 3 — failed entry with a live pane: cancel must still attempt a stop
 # ---------------------------------------------------------------------------
 
 

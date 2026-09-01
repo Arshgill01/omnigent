@@ -5599,15 +5599,15 @@ async def _drive_cancel_matrix_row(
             True,
         ),
         (
-            "failed_live_pane_503_falls_through",
+            "failed_live_pane_503_surfaces_error",
             "claude-code-native-ui",
             "failed",
             True,
             503,
             "stop_session",
             False,
-            "failed",
-            False,
+            "error",
+            None,
         ),
         (
             "failed_opencode_cached",
@@ -5628,7 +5628,7 @@ async def _drive_cancel_matrix_row(
         "antigravity_running_best_effort",
         "failed_dead_pane_cached_failure",
         "failed_live_pane_stop",
-        "failed_live_pane_503_falls_through",
+        "failed_live_pane_503_surfaces_error",
         "failed_opencode_cached",
     ],
 )
@@ -5659,9 +5659,10 @@ async def test_sys_cancel_task_native_harness_cancel_matrix(
     * ``failed_live_pane_stop`` — a failed Goose entry whose pane still
       answers must POST ``stop_session``. On main, non-Claude failed entries
       return cached status and never stop.
-    * ``failed_live_pane_503_falls_through`` — a live pane whose
-      ``stop_session`` returns 503 must still report the cached failure,
-      not the bridge error.
+    * ``failed_live_pane_503_surfaces_error`` — a live pane whose
+      ``stop_session`` returns 503 must surface the error: the kill attempt
+      failed against a possibly-live process, so a cached terminal status
+      would falsely tell the caller cleanup succeeded.
     * ``failed_opencode_cached`` — a failed OpenCode entry stays cached;
       there is no hard-stop to apply.
     """
@@ -5696,6 +5697,12 @@ async def test_sys_cancel_task_native_harness_cancel_matrix(
     assert posts == [{"type": expect_event, "data": {}}], (
         f"{row_id}: expected {expect_event} , got {posts}"
     )
+    if expect_status == "error":
+        assert isinstance(output, str) and output.startswith("Error:"), (
+            f"{row_id}: a failed stop must surface an error, got {output}"
+        )
+        assert "503" in output
+        return
     assert isinstance(output, dict)
     assert not str(output).startswith("Error:")
     if expect_best_effort:

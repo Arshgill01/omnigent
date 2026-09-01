@@ -7705,11 +7705,6 @@ def _best_effort_cancel_result(task_id: str, status: str) -> str:
     )
 
 
-def _stop_session_unconfirmed(error: str) -> bool:
-    """True when a hard-stop could not be applied because the pane is already gone."""
-    return "returned 503" in error
-
-
 async def _native_child_pane_alive(task_id: str, wrapper_label: str | None) -> bool:
     """Probe whether a failed native child's pane still answers.
 
@@ -7719,6 +7714,11 @@ async def _native_child_pane_alive(task_id: str, wrapper_label: str | None) -> b
     cannot kill a dead tmux session — it answers 503 — so a failed entry
     earns its hard-stop only when its registered pane is verifiably alive;
     otherwise the cached terminal failure is the truthful answer.
+
+    The probe reads this runner's terminal registry, which sees the child's
+    pane only because sub-agent sessions run co-located on the parent's
+    runner. If that ever changes, this returns ``False`` and a live failed
+    child degrades to the cached status instead of a hard-stop.
     """
     from omnigent.runner.native.interrupt import native_agent_for_cancel
     from omnigent.runtime import get_terminal_registry
@@ -7788,16 +7788,12 @@ async def _cancel_evicted_native_subagent(
         or native_cancel_capability(wrapper) != "stop"
     ):
         return f"Error: no in-flight task with task_id {task_id}"
+    # A stop failure (503 included) is surfaced as-is: the child runner
+    # answers 503 when the kill attempt failed, which can happen against a
+    # still-live pane, so reporting a terminal/absent status here would tell
+    # the caller cleanup succeeded while the process may keep running.
     stop_error = await _post_session_stop(server_client, task_id)
     if stop_error is not None:
-        if _stop_session_unconfirmed(stop_error):
-            return json.dumps(
-                {
-                    "cancelled": False,
-                    "task_id": task_id,
-                    "status": "absent",
-                }
-            )
         return stop_error
     return json.dumps({"cancelled": True, "task_id": task_id, "status": "cancelled"})
 
@@ -7821,9 +7817,9 @@ async def _cancel_subagent_task(
       interrupt only cancelled the current turn and left the worker
       process alive; a stop frees it. A ``failed`` stop-capable entry
       still routes when its pane answers the liveness probe — failed
-      does not mean exited. A dead pane, or a live pane whose
-      ``stop_session`` returns 503, falls through to the cached
-      terminal failure instead of surfacing the bridge error.
+      does not mean exited. A dead pane returns the cached terminal
+      failure without a stop attempt; a live pane whose ``stop_session``
+      fails surfaces the error, because the process may still be running.
     * best-effort natives (Codex, Pi, Antigravity, OpenCode) and
       in-process harnesses — POST ``interrupt``. No runner-side
       hard-stop is wired for them, so the result is reported
@@ -7881,8 +7877,9 @@ async def _cancel_subagent_task(
     except httpx.HTTPError as exc:
         return f"Error: sys_cancel_task {event_type} failed: {type(exc).__name__}: {exc}"
     if resp.status_code >= 400:
-        if entry.status == "failed" and capability == "stop" and resp.status_code == 503:
-            return _cached_subagent_cancel_result(str(task_id), entry.status)
+        # A 503 here means the stop attempt failed — the pane answered the
+        # liveness probe, so the process may still be running. Surface the
+        # error instead of a cached terminal status the caller would trust.
         return (
             f"Error: sys_cancel_task {event_type} returned {resp.status_code}: {resp.text[:200]}"
         )
