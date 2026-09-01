@@ -538,3 +538,143 @@ async def test_other_pane_writers_heal_dead_registered_pane(
         f"dead registered pane must heal for {event['type']}; "
         f"got auto_create_calls={auto_create_calls!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_recreated_pane_is_waited_for_before_injection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A recreate that yields a booting pane must be waited out, then typed into.
+
+    This is the case the readiness poll exists for: the recreate relaunches
+    Claude with ``--resume``, so the input box is not mounted yet and an
+    immediate inject would be lost. A recreate that produces no pane at all is
+    covered by ``test_failed_recreate_does_not_wait``.
+    """
+    conv_id = "18293a4b5c6d7e8f901a2b3c4d5e6f70"
+    auto_create_calls: list[str] = []
+    app, registry = await _open_claude_native_session(
+        monkeypatch, conv_id=conv_id, auto_create_calls=auto_create_calls
+    )
+    auto_create_calls.clear()
+    # A budget with room for several probes: the fixture's 0.2s is smaller than
+    # the first ``asyncio.to_thread`` hop, so the poll would exit after one.
+    monkeypatch.setattr(runner_app_module, "_CLAUDE_PANE_READY_TIMEOUT_S", 5.0)
+    monkeypatch.setattr(runner_app_module, "_CLAUDE_PANE_READY_POLL_S", 0.01)
+    bridge_dir = bridge_dir_for_conversation_id(conv_id)
+    _plant_dead_claude_pane(registry, conv_id, tmp_path, bridge_dir)
+
+    # A successful recreate registers a live pane, the way the real ensure path
+    # does before it advertises the tmux target.
+    async def _recreating_auto_create(
+        session_id: str,
+        resource_registry: object,
+        publish_event: object,
+        **_kwargs: object,
+    ) -> SessionResourceView:
+        del resource_registry, publish_event
+        auto_create_calls.append(session_id)
+        _plant_live_claude_pane(registry, session_id, tmp_path, bridge_dir)
+        return SessionResourceView(
+            id="terminal_claude_main",
+            type="terminal",
+            session_id=session_id,
+            name="claude",
+        )
+
+    async def _recreating_launch(ctx: Any) -> SessionResourceView:
+        return await _recreating_auto_create(ctx.session_id, None, None)
+
+    for target in (
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal",
+        "omnigent.runner.native._auto_create_claude_terminal",
+    ):
+        monkeypatch.setattr(target, _recreating_auto_create)
+    for target in (
+        "omnigent.runner.native.orchestration._launch_claude",
+        "omnigent.runner.native._launch_claude",
+    ):
+        monkeypatch.setattr(target, _recreating_launch)
+
+    captured: list[str] = []
+    # Not ready for the first two polls, as a booting TUI would be.
+    readiness = iter([False, False, True])
+
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "inject_slash_command",
+        lambda _bridge_dir, *, command, **_kwargs: captured.append(command),
+    )
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "claude_pane_ready",
+        lambda _bridge_dir: next(readiness, True),
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "effort_change", "effort": "high"},
+        )
+
+    assert resp.status_code == 204, resp.text
+    assert auto_create_calls == [conv_id], "dead pane must be recreated"
+    assert captured == ["/effort high"]
+    assert next(readiness, "exhausted") == "exhausted", (
+        "the poll must keep probing until the booting pane reports ready"
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_recreate_does_not_wait(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A recreate that produced no pane must not burn the readiness budget.
+
+    ``_ensure_native_terminal_for_turn`` swallows its own failures, so an
+    unregistered pane afterwards means nothing is booting. Polling cannot help;
+    the injection should fail fast as it did before the heal existed.
+    """
+    conv_id = "8293a4b5c6d7e8f901a2b3c4d5e6f701"
+    auto_create_calls: list[str] = []
+    app, registry = await _open_claude_native_session(
+        monkeypatch, conv_id=conv_id, auto_create_calls=auto_create_calls
+    )
+    auto_create_calls.clear()
+    # Budget the shipped value: a regression shows up as a 30s test.
+    monkeypatch.setattr(runner_app_module, "_CLAUDE_PANE_READY_TIMEOUT_S", 30.0)
+    monkeypatch.setattr(runner_app_module, "_CLAUDE_PANE_READY_POLL_S", 0.25)
+    bridge_dir = bridge_dir_for_conversation_id(conv_id)
+    _plant_dead_claude_pane(registry, conv_id, tmp_path, bridge_dir)
+
+    captured: list[str] = []
+    pane_ready_calls: list[Path] = []
+
+    def _never_ready(bridge_dir: Path) -> bool:
+        pane_ready_calls.append(bridge_dir)
+        return False
+
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "inject_slash_command",
+        lambda _bridge_dir, *, command, **_kwargs: captured.append(command),
+    )
+    monkeypatch.setattr(claude_native_bridge, "claude_pane_ready", _never_ready)
+
+    started = time.monotonic()
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "effort_change", "effort": "high"},
+        )
+    elapsed = time.monotonic() - started
+
+    assert resp.status_code == 204, resp.text
+    assert auto_create_calls == [conv_id], "the heal must still be attempted"
+    assert captured == ["/effort high"]
+    assert pane_ready_calls == [], (
+        f"a recreate that made no pane must not be polled; got {pane_ready_calls!r}"
+    )
+    assert elapsed < 5.0, f"failed recreate stalled {elapsed:.1f}s instead of failing fast"

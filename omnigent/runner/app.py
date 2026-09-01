@@ -4940,8 +4940,9 @@ def create_runner_app(
         itself in ``_restore_occupied_input``. Waiting here would stall the
         case inject already handles for the whole budget, then inject anyway.
 
-        No terminal registry means there is nothing to heal (inject keeps its
-        own short advertisement timeout).
+        No terminal registry means there is nothing to heal, and a recreate that
+        produced no pane is not waited on either (inject keeps its own short
+        advertisement timeout in both cases).
         """
         from omnigent.claude_native_bridge import claude_pane_ready
 
@@ -4954,9 +4955,16 @@ def create_runner_app(
             if terminal_name is not None
             else None
         )
+        # This probe duplicates the ensure path's own detection on purpose: its
+        # only job is to decide whether the readiness poll below runs at all.
         if instance is not None and await instance.is_alive():
             return
         await _ensure_native_terminal_for_turn(conv_id, "claude-native")
+        if terminal_registry.get(conv_id, terminal_name, "main") is None:
+            # The ensure swallows its own failures, so an unregistered pane here
+            # means nothing was created and nothing is booting. Waiting cannot
+            # help; let the injection fail fast as it did before.
+            return
         deadline = time.monotonic() + _CLAUDE_PANE_READY_TIMEOUT_S
         while True:
             if await asyncio.to_thread(claude_pane_ready, bridge_dir):
