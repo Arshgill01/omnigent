@@ -10,6 +10,7 @@ entry plus a missing tmux socket surfaced as ``503 claude_native_*_failed``.
 from __future__ import annotations
 
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -127,18 +128,10 @@ async def _open_claude_native_session(
         _stub_launch_claude,
     )
     monkeypatch.setattr("omnigent.runner.native._launch_claude", _stub_launch_claude)
-    monkeypatch.setattr(
-        runner_app_module,
-        "_CLAUDE_SESSION_CHANGE_PANE_READY_TIMEOUT_S",
-        0.2,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        runner_app_module,
-        "_CLAUDE_SESSION_CHANGE_PANE_READY_POLL_S",
-        0.01,
-        raising=False,
-    )
+    # No ``raising=False``: a renamed constant must fail the test loudly rather
+    # than silently leave the real 30s budget in place.
+    monkeypatch.setattr(runner_app_module, "_CLAUDE_PANE_READY_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(runner_app_module, "_CLAUDE_PANE_READY_POLL_S", 0.01)
     monkeypatch.setattr(
         claude_native_bridge,
         "read_model_env",
@@ -402,4 +395,146 @@ async def test_session_change_live_pane_does_not_recreate(
         f"live pane must not recreate; got auto_create_calls={auto_create_calls!r}"
     )
     assert captured == ["/effort high"]
-    assert pane_ready_calls, "live pane must be probed for readiness, then inject immediately"
+    # A live pane is never readiness-polled: only a recreate reboots the TUI.
+    # See ``test_live_pane_with_occupied_composer_does_not_stall`` for why
+    # polling a live pane would be actively harmful.
+    assert pane_ready_calls == [], (
+        f"live pane must not be readiness-probed; got {pane_ready_calls!r}"
+    )
+
+
+def _plant_live_claude_pane(
+    registry: TerminalRegistry,
+    conv_id: str,
+    tmp_path: Path,
+    bridge_dir: Path,
+) -> None:
+    """Register a live Claude pane advertising a socket that exists."""
+    sock = tmp_path / "omnigent-terminal-live" / "tmux.sock"
+    sock.parent.mkdir(parents=True, exist_ok=True)
+    sock.touch()
+    live = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=sock,
+        private_dir=tmp_path / "live_private",
+    )
+    live.running = True
+    (tmp_path / "live_private").mkdir(exist_ok=True)
+
+    async def _alive() -> bool:
+        return True
+
+    live.is_alive = _alive  # type: ignore[method-assign]
+    with registry._lock:
+        registry._by_conversation[conv_id] = {("claude", "main"): live}
+        registry._instance_locks[(conv_id, "claude", "main")] = threading.Lock()
+    write_tmux_target(bridge_dir, socket_path=sock, tmux_target="claude:0.0")
+
+
+@pytest.mark.asyncio
+async def test_live_pane_with_occupied_composer_does_not_stall(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A live pane reporting "not ready" must inject at once, not wait it out.
+
+    ``claude_pane_ready`` is false while a surface occupies the composer
+    (``!`` shell mode, the ctrl+r search, a hand-opened picker). Nothing in
+    this handler can clear one: ``inject_slash_command`` reclaims the composer
+    itself via ``_restore_occupied_input``. Polling here would burn the whole
+    budget on a case inject already handles, so the live pane must not be
+    polled at all.
+    """
+    conv_id = "e5f60718293a4b5c6d7e8f901a2b3c4d"
+    auto_create_calls: list[str] = []
+    app, registry = await _open_claude_native_session(
+        monkeypatch, conv_id=conv_id, auto_create_calls=auto_create_calls
+    )
+    auto_create_calls.clear()
+    # Budget the shipped value: a regression here shows up as a 30s test.
+    monkeypatch.setattr(runner_app_module, "_CLAUDE_PANE_READY_TIMEOUT_S", 30.0)
+    monkeypatch.setattr(runner_app_module, "_CLAUDE_PANE_READY_POLL_S", 0.25)
+    bridge_dir = bridge_dir_for_conversation_id(conv_id)
+    _plant_live_claude_pane(registry, conv_id, tmp_path, bridge_dir)
+
+    captured: list[str] = []
+    pane_ready_calls: list[Path] = []
+
+    def _fake_inject(bridge_dir: Path, *, command: str, **_kwargs: Any) -> None:
+        del bridge_dir
+        captured.append(command)
+
+    def _never_ready(bridge_dir: Path) -> bool:
+        pane_ready_calls.append(bridge_dir)
+        return False
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    monkeypatch.setattr(claude_native_bridge, "claude_pane_ready", _never_ready)
+
+    started = time.monotonic()
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "effort_change", "effort": "high"},
+        )
+    elapsed = time.monotonic() - started
+
+    assert resp.status_code == 204, resp.text
+    assert captured == ["/effort high"]
+    assert auto_create_calls == [], "a live pane must not be recreated"
+    assert pane_ready_calls == [], (
+        f"live pane must not be readiness-probed; got {pane_ready_calls!r}"
+    )
+    assert elapsed < 5.0, (
+        f"occupied composer on a live pane stalled {elapsed:.1f}s; inject "
+        "clears the surface itself, so this must not wait out the budget"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event", "conv_id"),
+    [
+        (
+            {"type": "permission_mode_change", "permission_mode": "acceptEdits"},
+            "f60718293a4b5c6d7e8f901a2b3c4d5e",
+        ),
+        ({"type": "compact"}, "0718293a4b5c6d7e8f901a2b3c4d5e6f"),
+    ],
+    ids=["permission_mode_change", "compact"],
+)
+async def test_other_pane_writers_heal_dead_registered_pane(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    event: dict[str, Any],
+    conv_id: str,
+) -> None:
+    """Every claude-native pane writer heals, not just model/effort.
+
+    ``permission_mode_change`` and ``compact`` drive the same advertised tmux
+    socket, so a dead-but-registered pane failed them the same way
+    (``503 claude_native_permission_mode_failed`` / ``_compact_failed``).
+    """
+    auto_create_calls: list[str] = []
+    app, registry = await _open_claude_native_session(
+        monkeypatch, conv_id=conv_id, auto_create_calls=auto_create_calls
+    )
+    auto_create_calls.clear()
+    bridge_dir = bridge_dir_for_conversation_id(conv_id)
+    _plant_dead_claude_pane(registry, conv_id, tmp_path, bridge_dir)
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        claude_native_bridge, "set_permission_mode", lambda *_a, **_k: "acceptEdits"
+    )
+    monkeypatch.setattr(claude_native_bridge, "claude_pane_ready", lambda _bridge_dir: True)
+
+    async with _runner_client(app) as client:
+        resp = await client.post(f"/v1/sessions/{conv_id}/events", json=event)
+
+    assert resp.status_code in (200, 204), resp.text
+    assert auto_create_calls == [conv_id], (
+        f"dead registered pane must heal for {event['type']}; "
+        f"got auto_create_calls={auto_create_calls!r}"
+    )

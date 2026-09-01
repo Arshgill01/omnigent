@@ -198,12 +198,13 @@ _CLAUDE_MODEL_CONFIRM_POLL_S = 0.25
 _CLAUDE_MODEL_LATE_DIALOG_BUDGET_S = 1200.0
 _CLAUDE_MODEL_LATE_DIALOG_POLL_S = 2.0
 
-# After a stale-pane recreate the TUI boots with ``--resume``. Poll until
-# the input box is usable before typing a session-change slash command.
-# A live ready pane passes the first probe. Module-level so tests can
-# tighten the budget.
-_CLAUDE_SESSION_CHANGE_PANE_READY_TIMEOUT_S = 30.0
-_CLAUDE_SESSION_CHANGE_PANE_READY_POLL_S = 0.05
+# After a stale-pane recreate the TUI reboots with ``--resume``. Poll until
+# the input box is usable before typing into it. Only a recreate waits: a live
+# pane is left to ``inject_slash_command``'s own composer reclaim. Same pacing
+# as the other pane polls above (one tmux capture each). Module-level so tests
+# can tighten the budget.
+_CLAUDE_PANE_READY_TIMEOUT_S = 30.0
+_CLAUDE_PANE_READY_POLL_S = 0.25
 
 
 def _warn_unresolved_sub_agent(session_id: str | None, sub_agent_name: str) -> None:
@@ -4897,6 +4898,7 @@ def create_runner_app(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
         try:
             settled = await asyncio.to_thread(
                 set_permission_mode,
@@ -4916,32 +4918,61 @@ def create_runner_app(
             )
         return JSONResponse(status_code=200, content={"permission_mode": settled})
 
-    async def _prepare_claude_native_pane_for_session_change(
+    async def _prepare_claude_native_pane_for_injection(
         conv_id: str,
         bridge_dir: Path,
     ) -> None:
-        """Heal a stale registered pane, then wait until slash injection can land.
+        """Heal a dead-but-registered Claude pane before typing into it.
 
-        ``_ensure_native_terminal_for_turn`` already probes ``is_alive()`` and
-        recreates a missing or dead registry entry. A live pane is a no-op.
-        After a recreate the TUI boots with ``--resume``, so we poll
-        ``claude_pane_ready`` before typing. A live ready pane passes the
-        first probe. No terminal registry means there is nothing to heal
-        (inject keeps its own short advertisement timeout).
+        Registry membership is not liveness: a pane whose tmux server died
+        without ``close()`` stays registered advertising a socket that is
+        gone, so anything typed into it fails: tmux cannot connect, or the pane
+        never renders. ``_ensure_native_terminal_for_turn`` already probes and
+        recreates such an entry, so it is reused rather than growing a second
+        recovery path.
+
+        Only a recreate waits for :func:`claude_pane_ready`, because only a
+        recreate reboots the TUI (via ``--resume``) with no input box yet.
+        That is what the ``is_alive()`` probe distinguishes. On a LIVE pane the
+        one thing that reports "not ready" is a surface occupying the composer
+        (shell mode, the ctrl+r search, a hand-opened picker), which this poll
+        has no way to clear: ``inject_slash_command`` reclaims the composer
+        itself in ``_restore_occupied_input``. Waiting here would stall the
+        case inject already handles for the whole budget, then inject anyway.
+
+        No terminal registry means there is nothing to heal (inject keeps its
+        own short advertisement timeout).
         """
         from omnigent.claude_native_bridge import claude_pane_ready
 
         terminal_registry = resource_registry.terminal_registry if resource_registry else None
         if terminal_registry is None:
             return
-        await _ensure_native_terminal_for_turn(conv_id, "claude-native")
-        if await asyncio.to_thread(claude_pane_ready, bridge_dir):
+        terminal_name = native_terminal_name("claude-native")
+        instance = (
+            terminal_registry.get(conv_id, terminal_name, "main")
+            if terminal_name is not None
+            else None
+        )
+        if instance is not None and await instance.is_alive():
             return
-        deadline = time.monotonic() + _CLAUDE_SESSION_CHANGE_PANE_READY_TIMEOUT_S
-        while time.monotonic() < deadline:
-            await asyncio.sleep(_CLAUDE_SESSION_CHANGE_PANE_READY_POLL_S)
+        await _ensure_native_terminal_for_turn(conv_id, "claude-native")
+        deadline = time.monotonic() + _CLAUDE_PANE_READY_TIMEOUT_S
+        while True:
             if await asyncio.to_thread(claude_pane_ready, bridge_dir):
                 return
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(_CLAUDE_PANE_READY_POLL_S)
+        # Let the injection report its own failure, as it did before this heal
+        # existed. Logged, else a pane that recreates but never boots is
+        # indistinguishable from a plain slow request.
+        _logger.warning(
+            "claude-native pane not ready %ss after re-create for session=%s; injecting anyway",
+            _CLAUDE_PANE_READY_TIMEOUT_S,
+            conv_id,
+            extra={"session_id": conv_id},
+        )
 
     async def _handle_claude_native_effort_change(
         conv_id: str,
@@ -4961,7 +4992,7 @@ def create_runner_app(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
-        await _prepare_claude_native_pane_for_session_change(conv_id, bridge_dir)
+        await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
         command = f"/effort {effort}"
         try:
             # An effort switch invalidates the prompt cache on a session with
@@ -5057,7 +5088,7 @@ def create_runner_app(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
-        await _prepare_claude_native_pane_for_session_change(conv_id, bridge_dir)
+        await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
         selected_model = model.strip()
         claude_config = await _resolve_session_claude_launch_config(conv_id)
         resolved_model = (
@@ -5260,6 +5291,7 @@ def create_runner_app(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
         try:
             await asyncio.to_thread(
                 inject_slash_command,
