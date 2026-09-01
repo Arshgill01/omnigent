@@ -2251,7 +2251,7 @@
         "type": "object"
       },
       "ImportSessionRequest": {
-        "description": "Request body for importing one local harness session.",
+        "description": "Request body for importing one local harness session.\n\n`project_id` files the imported session into a first-class project the\ncaller owns, with the same ownership, default-fill, and mismatch-warning\nsemantics as `POST /v1/sessions`.",
         "properties": {
           "external_session_id": {
             "maxLength": 128,
@@ -2272,6 +2272,17 @@
             "minItems": 1,
             "title": "Items",
             "type": "array"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
           },
           "source": {
             "enum": [
@@ -4688,6 +4699,12 @@
             "description": "In create mode, the new branch to create and check out, e.g. `\"feature/login\"`. In bind mode, the branch already checked out in the existing worktree. Validated against git ref-format rules; invalid names fail with `invalid_input`.",
             "title": "Branch Name",
             "type": "string"
+          },
+          "existing_branch": {
+            "default": false,
+            "description": "When `True`, `branch_name` already exists and the host checks it out into a fresh worktree (the deleted-worktree recreate path) instead of creating a new branch. Create mode only; invalid with `existing_worktree` and with `base_branch` (an existing branch has no base to fork).",
+            "title": "Existing Branch",
+            "type": "boolean"
           },
           "existing_worktree": {
             "default": false,
