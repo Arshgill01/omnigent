@@ -4950,13 +4950,11 @@ def create_runner_app(
         if terminal_registry is None:
             return
         terminal_name = native_terminal_name("claude-native")
-        instance = (
-            terminal_registry.get(conv_id, terminal_name, "main")
-            if terminal_name is not None
-            else None
-        )
+        if terminal_name is None:
+            return
         # This probe duplicates the ensure path's own detection on purpose: its
         # only job is to decide whether the readiness poll below runs at all.
+        instance = terminal_registry.get(conv_id, terminal_name, "main")
         if instance is not None and await instance.is_alive():
             return
         await _ensure_native_terminal_for_turn(conv_id, "claude-native")
