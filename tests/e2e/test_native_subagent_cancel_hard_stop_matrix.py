@@ -1,27 +1,17 @@
-"""End-to-end regression test: native sub-agent cancellation hard-stops only Claude.
+"""Native sub-agent cancel must hard-stop every uniform-stop harness.
 
-The bug: ``_cancel_subagent_task`` in tool_dispatch.py checks
-``entry.wrapper_label == CLAUDE_NATIVE_WRAPPER_VALUE`` to decide whether to
-POST ``stop_session`` (hard-stop) vs ``interrupt`` (best-effort signal).  This
-means:
+``sys_cancel_task`` routes through ``native_cancel_capability`` (Claude plus
+``_UNIFORM_STOP``), not a Claude-only wrapper-label compare. This matrix
+proves these cancel surfaces for cursor/goose/kiro/kimi/hermes/qwen:
 
-1. **Active entry, uniform-stop harness** — cursor/goose/kiro/kimi/hermes/qwen
-   all have ``_UNIFORM_STOP`` handlers on the runner that fire on
-   ``stop_session``, yet ``sys_cancel_task`` sends ``interrupt`` to them
-   instead.  The resident process can keep running after the cancel returns.
+1. **Active entry** — POST ``stop_session`` and report confirmed cancellation.
+2. **Evicted entry** — owned stop-capable natives still receive ``stop_session``.
+3. **Failed entry with a live pane** — liveness-probed ``stop_session``, not a
+   cached ``failed`` short-circuit.
+4. **Hard-stop 503** — a kill failure is unconfirmed/best-effort, never a
+   cached terminal / ``absent`` result (503 is not proof the pane is gone).
 
-2. **Evicted entry, non-claude-native** — ``_cancel_evicted_claude_native_subagent``
-   rejects any session whose wrapper label is not ``claude-code-native-ui``,
-   returning "no in-flight task" without sending a stop event even when the
-   child session is owned by the caller and its process may be alive.
-
-3. **Failed entry, non-claude-native** — ``can_stop_failed_claude`` only opens
-   the cleanup gate for claude-native, so a failed cursor-native (or similar)
-   entry returns cached status without attempting a stop, leaving the process
-   orphaned.
-
-All three are structural / runner-level bugs reproducible with a mock HTTP
-transport; no real harness binary is required.
+Reproduced with a mock HTTP transport; no real harness binary is required.
 
 Usage::
 
@@ -37,6 +27,7 @@ import httpx
 import pytest
 
 from omnigent._wrapper_labels import (
+    CLAUDE_NATIVE_WRAPPER_VALUE,
     CURSOR_NATIVE_WRAPPER_VALUE,
     WRAPPER_LABEL_KEY,
 )
@@ -118,18 +109,13 @@ def _make_cancel_server(
 async def test_cancel_active_uniform_stop_harness_sends_stop_session(
     wrapper_label: str,
 ) -> None:
-    """``sys_cancel_task`` must POST ``stop_session`` for harnesses in ``_UNIFORM_STOP``.
+    """``sys_cancel_task`` POSTs ``stop_session`` for every ``_UNIFORM_STOP`` harness.
 
-    These harnesses register a runner-side hard-stop handler
-    (``_UNIFORM_STOP`` in ``interrupt.py``), so the child runner *will*
-    honour ``stop_session`` and kill the resident process.  Posting
-    ``interrupt`` instead silently leaves the process running because the
-    uniform-stop harnesses' ``stop_session`` path is the only one that calls
-    ``kill_session``.
+    These harnesses register a runner-side hard-stop handler, so the child
+    runner honours ``stop_session`` and kills the resident process. Posting
+    ``interrupt`` instead leaves the process running.
 
-    **What fails on the buggy build:** the event sent is ``interrupt`` instead
-    of ``stop_session``.  After the fix the event is ``stop_session`` and the
-    result reflects confirmed cancellation.
+    On unfixed ``main`` the posted event is ``interrupt``.
     """
     parent_id = f"conv_parent_cancel_active_{wrapper_label}"
     child_id = f"conv_child_cancel_active_{wrapper_label}"
@@ -185,19 +171,14 @@ async def test_cancel_active_uniform_stop_harness_sends_stop_session(
 async def test_cancel_evicted_uniform_stop_harness_sends_stop_session(
     wrapper_label: str,
 ) -> None:
-    """``sys_cancel_task`` on an evicted non-claude-native entry must stop the session.
+    """An evicted owned stop-capable native still receives ``stop_session``.
 
-    When the work entry has been evicted from the in-process registry (e.g. due
-    to a runner restart) but the child session still exists on the server,
-    ``_cancel_evicted_claude_native_subagent`` is the fallback.  On the buggy
-    build it rejects any label that is not ``claude-code-native-ui`` and returns
-    "no in-flight task", leaving the resident process alive with no cleanup path.
+    When the work entry is gone from the in-process registry but the child
+    session still exists on the server, cancel must verify
+    ``parent_session_id`` ownership and POST ``stop_session`` for any
+    stop-capable wrapper, not only Claude.
 
-    After the fix the function (or its generalised replacement) accepts any owned
-    native session that supports a hard stop and posts ``stop_session``.
-
-    **What fails on the buggy build:** the result is an error string containing
-    "no in-flight task" and no event is sent.
+    On unfixed ``main`` the result is ``no in-flight task`` and no event is sent.
     """
     parent_id = f"conv_parent_evicted_{wrapper_label}"
     child_id = f"conv_child_evicted_{wrapper_label}"
@@ -262,24 +243,13 @@ async def test_cancel_failed_uniform_stop_harness_sends_stop_session(
     wrapper_label: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``sys_cancel_task`` on a ``failed`` non-claude-native entry must attempt a stop.
+    """A ``failed`` stop-capable entry with a live pane still posts ``stop_session``.
 
-    When a native harness's work entry is ``failed`` (the runner entry went
-    terminal e.g. due to a connectivity error) but the resident process may
-    still be alive, callers should be able to clean it up via
-    ``sys_cancel_task``.  On the buggy build, ``can_stop_failed_claude`` is
-    ``False`` for every non-claude-native harness, so the function short-circuits
-    and returns cached ``{'status': 'failed'}`` without sending any event.
+    ``failed`` does not mean the resident process exited. Cancel probes pane
+    liveness and hard-stops when the pane still answers.
 
-    After the fix, harnesses with a hard-stop capability open the same gate as
-    claude-native so the stop event is dispatched.
-
-    The child's pane is simulated alive: ``failed`` does not imply the
-    process exited, and a correct build may verify pane liveness before
-    hard-stopping (a stop posted to a dead pane can only fail).
-
-    **What fails on the buggy build:** no event is sent and the result contains
-    ``status: 'failed'`` with no stop attempt — even though the pane is alive.
+    On unfixed ``main`` the result is cached ``{'status': 'failed'}`` with no
+    stop attempt.
     """
     monkeypatch.setattr("omnigent.runtime.get_terminal_registry", lambda: _LivePaneRegistry())
     parent_id = f"conv_parent_failed_{wrapper_label}"
@@ -327,3 +297,122 @@ async def test_cancel_failed_uniform_stop_harness_sends_stop_session(
     assert events[0]["type"] == "stop_session", (
         f"Expected stop_session for failed {wrapper_label!r}; got {events[0]['type']!r}"
     )
+
+
+def _assert_unconfirmed_hard_stop(result: dict[str, Any], *, task_id: str) -> None:
+    """503 must be an explicit unconfirmed cancel, not a cached terminal status."""
+    assert result.get("cancelled") is False
+    assert result.get("cancel_requested") is True
+    assert result.get("cancel_confirmed") is False
+    assert result.get("best_effort") is True
+    assert result.get("task_id") == task_id
+    assert result.get("status") not in {"absent", "cancelled"}
+    assert result != {"cancelled": False, "task_id": task_id, "status": "failed"}
+    assert result != {"cancelled": False, "task_id": task_id, "status": "absent"}
+    message = str(result.get("message", "")).lower()
+    assert "may still be running" in message
+    assert "not confirmed" in message
+
+
+# ---------------------------------------------------------------------------
+# Facet 4 — stop_session 503 is failed-to-stop, not pane-gone
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wrapper_label",
+    [CLAUDE_NATIVE_WRAPPER_VALUE, "goose-native-ui"],
+)
+async def test_cancel_failed_live_pane_503_is_unconfirmed(
+    wrapper_label: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live failed pane whose hard-stop 503s is unconfirmed, not cached ``failed``.
+
+    ``_claude_stop`` already returns 204 for ``TmuxSessionNotAdvertised``; a 503
+    there is a kill failure on a process that is likely still alive.
+    ``_uniform_stop`` 503s any ``RuntimeError``, including a transient tmux
+    error against a live pane. Neither case may collapse into a cached
+    terminal status.
+    """
+    monkeypatch.setattr("omnigent.runtime.get_terminal_registry", lambda: _LivePaneRegistry())
+    parent_id = f"conv_parent_failed_503_{wrapper_label}"
+    child_id = f"conv_child_failed_503_{wrapper_label}"
+    runner_app.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="native_impl",
+        title="native-task",
+        wrapper_label=wrapper_label,
+    )
+    runner_app.mark_subagent_work_terminal(
+        child_id,
+        status="failed",
+        output="[System: native process crashed]",
+    )
+    events: list[dict[str, Any]] = []
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == f"/v1/sessions/{child_id}/events":
+            events.append(json.loads(request.content))
+            return httpx.Response(503, json={"error": "native_stop_failed"})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_handler),
+            base_url="http://server",
+        ) as server_client:
+            result_raw = await execute_tool(
+                tool_name="sys_cancel_task",
+                arguments=json.dumps({"task_id": child_id}),
+                server_client=server_client,
+                conversation_id=parent_id,
+                session_async_tasks={},
+            )
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+
+    result = json.loads(result_raw)
+    assert events == [{"type": "stop_session", "data": {}}]
+    _assert_unconfirmed_hard_stop(result, task_id=child_id)
+
+
+@pytest.mark.asyncio
+async def test_cancel_evicted_stop_503_is_unconfirmed() -> None:
+    """Evicted ``stop_session`` 503 must not report ``status: absent``."""
+    parent_id = "conv_parent_evicted_503"
+    child_id = "conv_child_evicted_503"
+    events: list[dict[str, Any]] = []
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{child_id}":
+            return httpx.Response(
+                200,
+                json={
+                    "id": child_id,
+                    "parent_session_id": parent_id,
+                    "labels": {WRAPPER_LABEL_KEY: "goose-native-ui"},
+                },
+            )
+        if request.method == "POST" and request.url.path == f"/v1/sessions/{child_id}/events":
+            events.append(json.loads(request.content))
+            return httpx.Response(503, json={"error": "native_stop_failed"})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://server",
+    ) as server_client:
+        result_raw = await execute_tool(
+            tool_name="sys_cancel_task",
+            arguments=json.dumps({"task_id": child_id}),
+            server_client=server_client,
+            conversation_id=parent_id,
+            session_async_tasks={},
+        )
+
+    result = json.loads(result_raw)
+    assert events == [{"type": "stop_session", "data": {}}]
+    _assert_unconfirmed_hard_stop(result, task_id=child_id)

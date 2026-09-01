@@ -432,6 +432,10 @@ class NativeInterruptRunner:
                 module.kill_session, module.bridge_dir_for_session_id(conv_id), timeout_s=1.0
             )
         except RuntimeError as exc:
+            # 503 means the kill attempt failed — including a transient tmux
+            # error against a still-running pane. This is not proof the pane
+            # is already gone. Claude's genuine gone case is
+            # ``TmuxSessionNotAdvertised`` and returns 204 from ``_claude_stop``.
             return JSONResponse(
                 status_code=503,
                 content={

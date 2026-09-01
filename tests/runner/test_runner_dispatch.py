@@ -5518,6 +5518,23 @@ async def _drive_cancel_matrix_row(
     return posts, output
 
 
+def _assert_unconfirmed_hard_stop(output: Any, *, task_id: str) -> None:
+    """A 503 hard-stop must not look like a cached terminal / absent result."""
+    assert isinstance(output, dict), f"expected JSON unconfirmed result, got {output!r}"
+    assert output.get("cancelled") is False
+    assert output.get("cancel_requested") is True
+    assert output.get("cancel_confirmed") is False
+    assert output.get("best_effort") is True
+    assert output.get("task_id") == task_id
+    assert output.get("status") not in {"absent", "cancelled"}
+    # Old masking collapsed 503 into these 3-key terminal shapes.
+    assert output != {"cancelled": False, "task_id": task_id, "status": "failed"}
+    assert output != {"cancelled": False, "task_id": task_id, "status": "absent"}
+    message = str(output.get("message", "")).lower()
+    assert "may still be running" in message
+    assert "not confirmed" in message
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     (
@@ -5599,15 +5616,26 @@ async def _drive_cancel_matrix_row(
             True,
         ),
         (
-            "failed_live_pane_503_surfaces_error",
+            "failed_live_pane_503_unconfirmed",
             "claude-code-native-ui",
             "failed",
             True,
             503,
             "stop_session",
+            True,
+            "unconfirmed",
             False,
-            "error",
+        ),
+        (
+            "running_stop_503_unconfirmed",
+            "goose-native-ui",
+            "running",
             None,
+            503,
+            "stop_session",
+            True,
+            "unconfirmed",
+            False,
         ),
         (
             "failed_opencode_cached",
@@ -5628,7 +5656,8 @@ async def _drive_cancel_matrix_row(
         "antigravity_running_best_effort",
         "failed_dead_pane_cached_failure",
         "failed_live_pane_stop",
-        "failed_live_pane_503_surfaces_error",
+        "failed_live_pane_503_unconfirmed",
+        "running_stop_503_unconfirmed",
         "failed_opencode_cached",
     ],
 )
@@ -5659,10 +5688,10 @@ async def test_sys_cancel_task_native_harness_cancel_matrix(
     * ``failed_live_pane_stop`` — a failed Goose entry whose pane still
       answers must POST ``stop_session``. On main, non-Claude failed entries
       return cached status and never stop.
-    * ``failed_live_pane_503_surfaces_error`` — a live pane whose
-      ``stop_session`` returns 503 must surface the error: the kill attempt
-      failed against a possibly-live process, so a cached terminal status
-      would falsely tell the caller cleanup succeeded.
+    * ``failed_live_pane_503_unconfirmed`` / ``running_stop_503_unconfirmed``
+      — a ``stop_session`` 503 is a failed kill, not a gone pane. Must
+      report explicit unconfirmed/best-effort, never the cached
+      ``failed`` / ``absent`` 3-key terminal shapes.
     * ``failed_opencode_cached`` — a failed OpenCode entry stays cached;
       there is no hard-stop to apply.
     """
@@ -5697,11 +5726,8 @@ async def test_sys_cancel_task_native_harness_cancel_matrix(
     assert posts == [{"type": expect_event, "data": {}}], (
         f"{row_id}: expected {expect_event} , got {posts}"
     )
-    if expect_status == "error":
-        assert isinstance(output, str) and output.startswith("Error:"), (
-            f"{row_id}: a failed stop must surface an error, got {output}"
-        )
-        assert "503" in output
+    if expect_status == "unconfirmed":
+        _assert_unconfirmed_hard_stop(output, task_id=child_id)
         return
     assert isinstance(output, dict)
     assert not str(output).startswith("Error:")
@@ -5760,6 +5786,23 @@ async def test_cancel_evicted_native_subagent_ownership_matrix(
     assert posts == [], f"{row_id}: foreign parent must not stop the child"
     assert isinstance(output, str)
     assert output.startswith("Error:")
+
+
+@pytest.mark.asyncio
+async def test_cancel_evicted_native_subagent_503_is_unconfirmed() -> None:
+    """Evicted stop 503 must not report ``absent`` as if the pane were gone."""
+    child_id = "conv_child_evicted_503"
+    posts, output = await _drive_cancel_matrix_row(
+        parent_id="conv_owner_evicted_503",
+        child_id=child_id,
+        wrapper_label="goose-native-ui",
+        status="running",
+        http_status=503,
+        evicted=True,
+        requesting_parent="conv_owner_evicted_503",
+    )
+    assert posts == [{"type": "stop_session", "data": {}}]
+    _assert_unconfirmed_hard_stop(output, task_id=child_id)
 
 
 def test_session_status_to_task_status_maps_known_values() -> None:
