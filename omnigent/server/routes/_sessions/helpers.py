@@ -8279,6 +8279,15 @@ async def _create_session_worktree(
         raise OmnigentError(exc.message, code=ErrorCode.INVALID_INPUT) from exc
 
 
+# Opt-in ``?delete_branch=true`` cannot reach git when the host tunnel
+# is down (users typically see this as ``runner_online: false``). Refuse
+# the delete instead of 404'ing or silently skipping cleanup. See #6110.
+_DELETE_WORKTREE_OFFLINE_MESSAGE = (
+    "Cannot delete worktree — runner offline. "
+    "Delete session only (delete_branch=false) or wait for the runner to reconnect."
+)
+
+
 async def _remove_session_worktree_best_effort(
     *,
     host_id: str,
@@ -8289,13 +8298,17 @@ async def _remove_session_worktree_best_effort(
     reason: str,
     conversation_store: ConversationStore | None = None,
     exclude_conversation_id: str | None = None,
+    fail_if_unavailable: bool = False,
 ) -> None:
     """
     Best-effort removal of a session's git worktree.
 
     Used for create-rollback (orphan cleanup) and opt-in session-delete
-    cleanup. Never raises — a failure is logged so the caller's primary
-    operation still completes.
+    cleanup. Host-reported git failures are logged so the caller's
+    primary operation still completes. When ``fail_if_unavailable`` is
+    set, an unreachable host raises ``CONFLICT`` instead of skipping —
+    the session is left in place so the caller can retry without
+    worktree cleanup.
 
     :param host_id: Host that owns the worktree, e.g.
         ``"host_a1b2c3d4..."``.
@@ -8315,32 +8328,22 @@ async def _remove_session_worktree_best_effort(
     :param exclude_conversation_id: The conversation whose delete triggered
         this removal, excluded from that check. Required with
         *conversation_store*.
+    :param fail_if_unavailable: When ``True``, raise ``CONFLICT`` if the
+        host cannot be reached to run git. Create-rollback leaves this
+        ``False`` so a failed create still surfaces its original error.
     """
     from omnigent.server.routes._host_worktree import (
+        WorktreeHostUnavailableError,
         WorktreeProxyError,
         remove_worktree_on_host,
     )
 
-    # Host reachability first: both checks below end in "skip", and this one
-    # is an in-memory lookup, so an unreachable host costs no DB work.
-    host_registry = getattr(request.app.state, "host_registry", None)
-    if host_registry is None:
-        return
-    host_conn = host_registry.get(host_id)
-    if host_conn is None:
-        _logger.warning(
-            "Skipping worktree removal (%s) for %s: host %s offline",
-            reason,
-            worktree_path,
-            host_id,
-        )
-        return
-
     # A fork reusing the source's directory, or several sessions attached to
     # one existing worktree, all run in the same cwd. Removing it under them
     # leaves their runners on a deleted directory, so leave a shared worktree
-    # alone and let the last session out clean it up. Only a skip is logged;
-    # the caller still deletes its own row.
+    # alone and let the last session out clean it up. Checked before host
+    # reachability so an offline host does not 409 a delete that would not
+    # have touched the directory anyway.
     if conversation_store is not None and exclude_conversation_id is not None:
         shared = await asyncio.to_thread(
             conversation_store.has_other_live_session_in_workspace,
@@ -8355,6 +8358,29 @@ async def _remove_session_worktree_best_effort(
                 reason,
             )
             return
+
+    host_registry = getattr(request.app.state, "host_registry", None)
+    if host_registry is None:
+        if fail_if_unavailable:
+            raise OmnigentError(
+                "host registry is not configured; cannot delete a worktree",
+                code=ErrorCode.INTERNAL_ERROR,
+            )
+        return
+    host_conn = host_registry.get(host_id)
+    if host_conn is None:
+        if fail_if_unavailable:
+            raise OmnigentError(
+                _DELETE_WORKTREE_OFFLINE_MESSAGE,
+                code=ErrorCode.CONFLICT,
+            )
+        _logger.warning(
+            "Skipping worktree removal (%s) for %s: host %s offline",
+            reason,
+            worktree_path,
+            host_id,
+        )
+        return
     try:
         await remove_worktree_on_host(
             host_registry=host_registry,
@@ -8362,6 +8388,18 @@ async def _remove_session_worktree_best_effort(
             worktree_path=worktree_path,
             branch=branch,
             delete_branch=delete_branch,
+        )
+    except WorktreeHostUnavailableError as exc:
+        if fail_if_unavailable:
+            raise OmnigentError(
+                _DELETE_WORKTREE_OFFLINE_MESSAGE,
+                code=ErrorCode.CONFLICT,
+            ) from exc
+        _logger.warning(
+            "Best-effort worktree removal (%s) failed for %s: host %s unavailable",
+            reason,
+            worktree_path,
+            host_id,
         )
     except WorktreeProxyError:
         _logger.warning(

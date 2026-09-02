@@ -9995,7 +9995,7 @@
     },
     "/v1/sessions/{session_id}": {
       "delete": {
-        "description": "Delete a session and all associated resources.\n\nRequires owner-level access. Tears down tasks, runner-side\nresources (environments, terminals), session files, and the\nconversation row.\n\n**Returns:** A `ConversationDeleted` confirmation.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session or no access, 403 if insufficient permissions.",
+        "description": "Delete a session and all associated resources.\n\nRequires owner-level access. Tears down tasks, runner-side\nresources (environments, terminals), session files, and the\nconversation row.\n\n**Returns:** A `ConversationDeleted` confirmation.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session or no access, 403 if insufficient permissions, 409 if `delete_branch=true` and the host is offline so worktree cleanup cannot run.",
         "operationId": "delete_session_v1_sessions__session_id__delete",
         "parameters": [
           {
@@ -10009,7 +10009,7 @@
             }
           },
           {
-            "description": "Opt-in git cleanup, as a query param (`?delete_branch=true`). When `True` and the session has a server-created worktree (`git_branch` set), the host removes the worktree directory and deletes its branch (`git worktree remove --force` then `git branch -D`). Ignored for sessions with no worktree. Best-effort: a cleanup failure does not block the delete. Defaults to `False` (worktree and branch left untouched). See designs/SESSION_GIT_WORKTREE.md.",
+            "description": "Opt-in git cleanup, as a query param (`?delete_branch=true`). When `True` and the session has a server-created worktree (`git_branch` set), the host removes the worktree directory and deletes its branch (`git worktree remove --force` then `git branch -D`). Ignored for sessions with no worktree. If the host tunnel is down (typically `runner_online: false`), the delete is rejected with 409 so the caller can retry without cleanup rather than receiving a misleading 404. A host-reported git failure is still logged and does not block the delete. Defaults to `False` (worktree and branch left untouched). See designs/SESSION_GIT_WORKTREE.md.",
             "in": "query",
             "name": "delete_branch",
             "required": false,
