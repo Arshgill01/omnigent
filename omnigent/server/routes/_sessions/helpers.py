@@ -8281,7 +8281,7 @@ async def _create_session_worktree(
 
 # Opt-in ``?delete_branch=true`` cannot reach git when the host tunnel
 # is down (users typically see this as ``runner_online: false``). Refuse
-# the delete instead of 404'ing or silently skipping cleanup. See #6110.
+# the delete instead of 404'ing or silently skipping cleanup.
 _DELETE_WORKTREE_OFFLINE_MESSAGE = (
     "Cannot delete worktree — runner offline. "
     "Delete session only (delete_branch=false) or wait for the runner to reconnect."

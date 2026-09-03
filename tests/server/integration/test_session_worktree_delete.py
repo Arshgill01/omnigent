@@ -421,6 +421,31 @@ async def test_delete_with_flag_when_host_offline_returns_conflict(
     _assert_session_still_exists(db_uri, conv_id)
 
 
+async def test_refused_delete_keeps_session_files(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A 409-refused delete must be non-destructive end to end: the
+    session's files must survive alongside the row, so a later retry
+    (runner back online, or without the flag) deletes a fully intact
+    session rather than one whose files were already destroyed.
+    """
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    _upsert_host_row(db_uri)
+    conv_id = _make_worktree_conversation(db_uri)
+    file_store = SqlAlchemyFileStore(db_uri)
+    stored = file_store.create("notes.txt", 4, "text/plain", session_id=conv_id)
+
+    resp = await client.delete(f"/v1/sessions/{conv_id}?delete_branch=true")
+    _assert_worktree_offline_conflict(resp)
+    _assert_session_still_exists(db_uri, conv_id)
+    assert file_store.get(stored.id, session_id=conv_id) is not None, (
+        "the refused delete must not have destroyed the session's files"
+    )
+
+
 async def test_delete_without_flag_when_host_offline_still_deletes(
     client: httpx.AsyncClient,
     db_uri: str,
@@ -442,8 +467,8 @@ async def test_delete_with_flag_when_runner_offline_and_host_offline_returns_con
     db_uri: str,
 ) -> None:
     """
-    Reproduce #6110: worktree session, runner unreachable, delete_branch
-    set. Must not map to 404 (session-not-found); the session exists and
+    Worktree session, runner unreachable, delete_branch set. Must not
+    map to 404 (session-not-found); the session exists and
     the user owns it — cleanup cannot proceed because the host/runner
     tunnel is down.
     """

@@ -2261,18 +2261,12 @@ def register_events_routes(
 
             with contextlib.suppress(RuntimeError):
                 await get_terminal_registry().cleanup_conversation(session_id)
-        # Session file cleanup.
-        if file_store is not None and artifact_store is not None:
-            deleted_file_ids = await asyncio.to_thread(
-                file_store.delete_all_for_session, session_id
-            )
-            for fid in deleted_file_ids:
-                await asyncio.to_thread(artifact_store.delete, fid)
         # Opt-in git worktree cleanup: only when delete_branch=true and
         # the session has a server-created worktree. Runs after runner
-        # teardown. An unreachable host fails the delete (409) so the
-        # caller can retry without cleanup; git errors on a reachable
-        # host stay best-effort.
+        # teardown but before the irreversible file cleanup below: an
+        # unreachable host fails the delete (409) with the session
+        # retained, so nothing irrecoverable may be destroyed first.
+        # Git errors on a reachable host stay best-effort.
         if (
             delete_branch
             and conv.git_branch is not None
@@ -2290,6 +2284,13 @@ def register_events_routes(
                 exclude_conversation_id=conv.id,
                 fail_if_unavailable=True,
             )
+        # Session file cleanup.
+        if file_store is not None and artifact_store is not None:
+            deleted_file_ids = await asyncio.to_thread(
+                file_store.delete_all_for_session, session_id
+            )
+            for fid in deleted_file_ids:
+                await asyncio.to_thread(artifact_store.delete, fid)
         _interrupt_fenced_sessions.discard(session_id)
         _intentional_stop_sessions.discard(session_id)
         deleted = await conversation_store.delete_conversation(session_id)
