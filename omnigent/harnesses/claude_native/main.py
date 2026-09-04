@@ -39,7 +39,7 @@ if sys.platform != "win32":
     import termios
     import tty
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -117,6 +117,7 @@ from omnigent.models.claude_model_vocabulary import (
     CUSTOM_MODEL_OPTION_NAME_ENV_VAR,
     LEGACY_CUSTOM_SLOT_ROW_ID,
     claude_model_alias,
+    served_canonical_overrides,
 )
 from omnigent.native._native_resume_hint import echo_native_resume_hint
 from omnigent.native.native_coding_agents import native_shell_terminal_spec
@@ -415,12 +416,17 @@ class ClaudeNativeUcodeConfig:
         so a router may pick it. Empty when the endpoint's catalog was
         not enumerated (cached ucode state, managed settings, a
         non-Databricks provider).
+    :param model_overrides: Provider-scoped canonical-to-served rewrites for
+        Claude Code's ``modelOverrides`` setting. Consumers treat both sides
+        as opaque ids; an empty map means the provider supplied no reliable
+        equivalence information.
     """
 
     env: dict[str, str]
     api_key_helper: str | None = None
     model: str | None = None
     routable_models: tuple[str, ...] = ()
+    model_overrides: dict[str, str] = field(default_factory=dict)
 
 
 def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> bool:
@@ -2811,6 +2817,9 @@ def _ucode_config_for_profile(
         or configured_default
         or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
         routable_models=routable_models,
+        # Databricks discovery reports ids that wrap the canonical Claude id.
+        # Keep that translation here; launch consumers treat ids as opaque.
+        model_overrides=served_canonical_overrides(routable_models),
     )
 
 
@@ -6017,6 +6026,7 @@ def _claude_terminal_request(
         ap_server_url=ap_server_url,
         ap_auth_headers=ap_auth_headers,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
+        model_overrides=claude_config.model_overrides if claude_config is not None else None,
         append_system_prompt=append_system_prompt,
         allowed_tools=allowed_tools,
     )

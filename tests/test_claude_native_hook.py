@@ -1919,6 +1919,40 @@ def test_build_hook_settings_omits_apikeyhelper_when_none(
     assert with_helper["apiKeyHelper"] == "printf tok"
 
 
+def test_build_hook_settings_merges_model_overrides_next_to_apikeyhelper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Canonical-to-served rewrites land next to ``apiKeyHelper``."""
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_test", workspace=tmp_path)
+    overrides = {"claude-opus-4-8": "databricks-claude-opus-4-8"}
+
+    settings = build_hook_settings(
+        bridge_dir,
+        api_key_helper="printf tok",
+        model_overrides=overrides,
+    )
+
+    assert settings["apiKeyHelper"] == "printf tok"
+    assert settings["modelOverrides"] == overrides
+
+
+def test_build_hook_settings_omits_model_overrides_when_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty map leaves Claude Code as it behaves today."""
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_test", workspace=tmp_path)
+
+    assert "modelOverrides" not in build_hook_settings(bridge_dir)
+    assert "modelOverrides" not in build_hook_settings(bridge_dir, model_overrides=None)
+    assert "modelOverrides" not in build_hook_settings(bridge_dir, model_overrides={})
+
+
 def test_evaluate_policy_retries_5xx_and_succeeds(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
