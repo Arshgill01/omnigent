@@ -1,192 +1,177 @@
-"""Harness-bench model-override false-positive e2e test (native-TUI transport).
+"""Harness-bench ``model_override`` verdict on the native-TUI transport.
 
-Reproduces the bug: the ``model_override`` probe reports **SUPPORTED** for a
-native-TUI harness (``pi-native`` and every native-TUI harness) purely because a
-turn completed, *without the caller-specified model ever being sent to the
-harness*.
-
-Why this is a false positive:
-
-- ``ModelOverrideProbe`` (``tests/harness_bench/probes/model_override.py``)
-  assumes, per its own docstring, that "the driver launches the harness with the
-  profile's model in ``{env_prefix}MODEL``". Its live half then returns
-  ``SUPPORTED`` from ``result.completed and result.text`` alone.
-- The native-TUI driver (``tests/harness_bench/native_tui_driver.py``) never
-  threads ``profile.model`` anywhere: it has **zero** references to
-  ``profile.model`` / ``env_prefix`` / ``MODEL``, and the probe-facing contract
-  ``Driver.run_basic_turn(marker)`` carries only the marker — never a model. Live
-  confirmation: the driver provisions ``pi`` on the config-default model
-  (``databricks-claude-sonnet-4-5``) while the profile's caller-specified model
-  is ``databricks-claude-sonnet-4-6``; the driver never asks for the latter.
-- Because the profile *declares* ``model_override=SUPPORTED`` for native
-  harnesses, the false ``SUPPORTED`` observation reconciles to ``SUPPORTED`` with
-  **no DRIFT** — so the matrix silently hides that native-TUI never actually
-  routed the caller's model.
-
-This test drives the **real** bench pipeline (``run_harness`` — the same entry
-``python -m tests.harness_bench --harness pi-native --dimension model_override
---live`` invokes) and the **real** ``BasicTurnProbe`` + ``ModelOverrideProbe``.
-Following the repo's established probe-test convention (see
-``tests/harness_bench/test_bench.py``'s ``resolve_driver_class`` monkeypatch and
-``_OKDriver``), it injects a *native-TUI-faithful* driver: it completes a turn
-with text exactly as the real driver does on the happy path, and records every
-model it was ever asked to route — which, matching the real driver, is nothing.
-
-Running the real subprocess command against a live gateway is what the reporter
-did; it is exercised in-process here because the vendored ``pi`` Node CLI cannot
-tunnel a locked-down egress proxy (so a full ``--live`` subprocess run would SKIP
-on the basic-turn prerequisite rather than reach the ``SUPPORTED`` verdict). The
-probe-logic false positive being reproduced is environment-independent: it
-depends only on a turn completing with text, which is the documented happy path.
-
-Regression contract (fail on buggy code, pass once fixed): the ``model_override``
-probe must not report ``SUPPORTED`` when the caller-specified model was never
-routed to the driver. Today it does — this test fails on ``main``. After a fix
-(the probe verifies the model actually routed, or native-TUI honestly reports it
-cannot route a caller-specified model), it passes.
-
-Usage::
-
-    python -m pytest tests/e2e/test_harness_bench_model_override_native_tui_e2e.py -v
+Runs the real ``python -m tests.harness_bench --harness pi-native --dimension
+model_override --live`` command against the real Pi CLI, with Pi's omnigent
+provider pointed at a local mock model endpoint that records every request. If
+the caller-specified bench model never reached the endpoint, the probe must not
+report ``SUPPORTED``. Skips when pi or tmux is unavailable or the basic turn
+cannot complete here.
 """
 
 from __future__ import annotations
 
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from collections.abc import Iterator
+from pathlib import Path
+
+import httpx
 import pytest
+import yaml
 
-from tests.harness_bench.bench import run_harness
-from tests.harness_bench.driver import ForkResult, TurnResult
+from tests._helpers.live_server import find_free_port
+from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.harness_bench.manifest import OFFICIAL_PROFILES
-from tests.harness_bench.probes.basic_turn import BasicTurnProbe
-from tests.harness_bench.probes.model_override import ModelOverrideProbe
-from tests.harness_bench.profile import BenchProfile
-from tests.harness_bench.verdict import Verdict
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_MOCK_SERVER = _REPO_ROOT / "tests" / "server" / "integration" / "mock_llm_server.py"
+
+_HARNESS = "pi-native"
+_PROFILE = OFFICIAL_PROFILES[_HARNESS]
+# The model the configured provider serves by default; deliberately not the
+# bench profile's model, so a request carrying it is unambiguous.
+_PROVIDER_DEFAULT_MODEL = "claude-sonnet-4-20250514"
+
+_BENCH_CMD = [
+    sys.executable,
+    "-m",
+    "tests.harness_bench",
+    "--harness",
+    _HARNESS,
+    "--dimension",
+    "model_override",
+    "--live",
+    "--no-rich",
+    "--no-color",
+    "--json",
+]
+_BENCH_TIMEOUT_S = 300.0
+_MOCK_READY_TIMEOUT_S = 10.0
+
+pytestmark = [
+    pytest.mark.skipif(shutil.which("tmux") is None, reason="requires tmux (native TUI pane)"),
+    pytest.mark.timeout(420),
+]
 
 
-class _NativeTuiFaithfulDriver:
-    """A native-TUI driver stand-in faithful to the real one's contract.
-
-    Mirrors ``tests/harness_bench/native_tui_driver.py``: a basic turn completes
-    with text, and the only thing the probe-facing contract carries is the
-    marker (``run_basic_turn(marker)``) — never a model. It records every model
-    it was asked to route so the test can assert the caller-specified model was
-    never sent (the real driver routes the config default, not ``profile.model``).
-    """
-
-    transport = "native-tui"
-
-    # ``run_harness`` instantiates the resolved driver class itself, so the test
-    # recovers the live instance through this registry.
-    instances: list[_NativeTuiFaithfulDriver] = []
-
-    def __init__(self, profile: BenchProfile, *, databricks_profile: str | None = None) -> None:
-        self.profile = profile
-        # Every marker the probe pipeline drove a basic turn with.
-        self.basic_turn_markers: list[str] = []
-        # Every model the driver was ever explicitly asked to route on. The real
-        # native-TUI driver has no such channel, so this stays empty — the whole
-        # point of the bug.
-        self.routed_models: list[str] = []
-        _NativeTuiFaithfulDriver.instances.append(self)
-
-    @staticmethod
-    def unavailable(profile: BenchProfile, *, databricks_profile: str | None) -> str | None:
-        return None
-
-    async def __aenter__(self) -> _NativeTuiFaithfulDriver:
-        return self
-
-    async def __aexit__(self, *exc: object) -> None:
-        return None
-
-    async def run_basic_turn(self, marker: str) -> TurnResult:
-        # Happy-path native-TUI behaviour: a turn completes and echoes the
-        # marker. The caller-specified model is *not* an argument here — exactly
-        # the gap the bug exploits.
-        self.basic_turn_markers.append(marker)
-        return TurnResult(completed=True, text=marker)
-
-    # Remaining Driver-protocol methods so the pipeline stays well-formed even if
-    # the selected probe set grows; unused by this test's probes.
-    async def run_streaming_turn(self) -> TurnResult:
-        return TurnResult(completed=True, text_delta_count=5)
-
-    async def run_reasoning_turn(self) -> TurnResult:
-        return TurnResult(completed=True, reasoning_delta_count=2)
-
-    async def run_tool_turn(self, *, deny: bool) -> TurnResult:
-        return TurnResult(completed=True)
-
-    async def run_mcp_tool_turn(self) -> TurnResult:
-        return TurnResult(completed=True)
-
-    async def run_fork_turn(self, marker: str) -> ForkResult:
-        return ForkResult(created=True, history_copied=True, recalled=True)
-
-    async def run_policy_turn(self, *, action: str) -> TurnResult:
-        return TurnResult(completed=True)
-
-    async def run_interrupt_turn(self) -> TurnResult:
-        return TurnResult(cancelled=True)
+@pytest.fixture
+def mock_model_endpoint(tmp_path: Path) -> Iterator[str]:
+    """A mock model endpoint answering every turn with the bench marker."""
+    port = find_free_port()
+    log = (tmp_path / "mock_llm.log").open("w")
+    proc = subprocess.Popen(
+        [sys.executable, str(_MOCK_SERVER), str(port)],
+        env={**os.environ, "PYTHONPATH": str(_REPO_ROOT)},
+        stdout=log,
+        stderr=subprocess.STDOUT,
+    )
+    base_url = f"http://127.0.0.1:{port}"
+    try:
+        deadline = time.monotonic() + _MOCK_READY_TIMEOUT_S
+        while True:
+            try:
+                if httpx.get(f"{base_url}/stats", timeout=1.0).status_code == 200:
+                    break
+            except httpx.HTTPError:
+                pass
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"mock model endpoint did not start; log at {log.name}")
+            time.sleep(0.1)
+        httpx.post(
+            f"{base_url}/mock/set_fallback",
+            json={"key": "default", "text": _PROFILE.marker},
+            timeout=5.0,
+        ).raise_for_status()
+        yield base_url
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        log.close()
 
 
-async def test_model_override_not_supported_without_routing_model_native_tui(
-    monkeypatch: pytest.MonkeyPatch,
+def _provider_config(base_url: str) -> str:
+    return yaml.safe_dump(
+        {
+            "providers": {
+                "bench-mock": {
+                    "kind": "key",
+                    "default": ["anthropic"],
+                    "anthropic": {
+                        "base_url": base_url,
+                        "api_key": "mock-key",
+                        "models": {"default": _PROVIDER_DEFAULT_MODEL},
+                    },
+                }
+            }
+        }
+    )
+
+
+def _bench_env(config_home: Path) -> dict[str, str]:
+    # A leaked runner/host identity would make the bench's own server and host
+    # daemon take the zygote path instead of booting clean.
+    stripped = ("OMNIGENT_RUNNER_", "OMNIGENT_HOST_", "RUNNER_SERVER_URL")
+    env = {k: v for k, v in os.environ.items() if not k.startswith(stripped)}
+    env["OMNIGENT_CONFIG_HOME"] = str(config_home)
+    # Every bench child (server, host daemon, runner) must import this checkout,
+    # whatever cwd it runs from.
+    env["PYTHONPATH"] = str(_REPO_ROOT)
+    return env
+
+
+def _requested_models(base_url: str) -> set[str]:
+    requests = httpx.get(f"{base_url}/mock/requests", timeout=5.0).json()["requests"]
+    return {str(r["model"]) for r in requests if isinstance(r, dict) and r.get("model")}
+
+
+def test_native_tui_model_override_is_not_supported_when_model_never_sent(
+    tmp_path: Path, mock_model_endpoint: str
 ) -> None:
-    """model_override must not report SUPPORTED when the caller's model is never routed.
+    reason = cli_unavailable_reason(_PROFILE.cli_binary or "pi")
+    if reason is not None:
+        pytest.skip(reason)
 
-    Drives the real bench pipeline for ``pi-native`` with the real basic-turn +
-    model-override probes and a native-TUI-faithful driver. On ``main`` the probe
-    reports ``SUPPORTED`` from mere turn completion though the driver was never
-    asked to route ``profile.model`` — this assertion fails there. After a fix
-    that ties the verdict to the model actually routing, it passes.
-    """
-    profile = OFFICIAL_PROFILES["pi-native"]
-    assert profile.transport == "native-tui", "test targets the native-TUI transport"
-    # The profile declares model_override SUPPORTED, so a false SUPPORTED
-    # observation hides as a no-drift cell — part of why the bug is silent.
-    assert profile.declared_for("model_override") is Verdict.SUPPORTED
-
-    _NativeTuiFaithfulDriver.instances.clear()
-    monkeypatch.setattr(
-        "tests.harness_bench.bench.resolve_driver_class",
-        lambda p, *, override=None, fast=False: _NativeTuiFaithfulDriver,
+    config_home = tmp_path / "omnigent-config"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(
+        _provider_config(mock_model_endpoint), encoding="utf-8"
     )
 
-    report = await run_harness(
-        profile,
-        probes=[BasicTurnProbe(), ModelOverrideProbe()],
-        databricks_profile="oss",
-        live=True,
+    proc = subprocess.run(
+        _BENCH_CMD,
+        cwd=_REPO_ROOT,
+        env=_bench_env(config_home),
+        capture_output=True,
+        text=True,
+        timeout=_BENCH_TIMEOUT_S,
+        check=False,
     )
+    output = f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+    assert proc.stdout.strip(), output
+    report = json.loads(proc.stdout)["harnesses"][0]
+    cells = {cell["dimension"]: cell for cell in report["cells"]}
 
-    assert _NativeTuiFaithfulDriver.instances, "the bench pipeline never built the driver"
-    driver = _NativeTuiFaithfulDriver.instances[-1]
+    if report["skipped_reason"] or cells["basic_turn"]["observed"] != "supported":
+        pytest.skip(f"native-tui {_HARNESS} could not complete a basic turn here:\n{output}")
 
-    cells = {c.probe_name: c for c in report.cells}
-    assert "model_override" in cells, "model_override cell missing from report"
-    mo = cells["model_override"]
+    requested = _requested_models(mock_model_endpoint)
+    assert requested, f"the bench turns never reached the model endpoint\n{output}"
+    if _PROFILE.model in requested:
+        # The transport applied the override this time, so SUPPORTED is earned.
+        return
 
-    # Sanity: the prerequisite turn completed with text (the condition the probe
-    # misreads), and the caller-specified model was never communicated anywhere.
-    assert cells["basic_turn"].observed is Verdict.SUPPORTED
-    model_was_routed = profile.model in driver.routed_models or any(
-        profile.model in marker for marker in driver.basic_turn_markers
+    cell = cells["model_override"]
+    assert cell["observed"] != "supported", (
+        f"model_override reported SUPPORTED although the transport never sent "
+        f"{_PROFILE.model!r} to the model (requests used {sorted(requested)}):\n"
+        f"cell={cell}\n{output}"
     )
-    assert not model_was_routed, (
-        "test premise broken: the caller-specified model was routed to the driver "
-        f"(routed_models={driver.routed_models}, markers={driver.basic_turn_markers})"
-    )
-
-    # Regression invariant: with the caller-specified model
-    # never routed, model_override must not be reported SUPPORTED. On buggy code
-    # it is SUPPORTED with the note "turn routed on caller-specified model
-    # 'databricks-claude-sonnet-4-6'" — a false positive from a bare completion.
-    assert mo.observed is not Verdict.SUPPORTED, (
-        "model_override regression: reported SUPPORTED for pi-native "
-        f"(note={mo.note!r}) although the caller-specified model {profile.model!r} "
-        f"was never sent to the driver (routed_models={driver.routed_models}, "
-        f"basic_turn_markers={driver.basic_turn_markers}). A completing turn was "
-        "misread as proof the override routed; the declared SUPPORTED then hides "
-        "it as a no-drift cell."
-    )
+    assert "caller-specified model" not in cell["note"], cell
